@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anpr-autogate-system"
+version = "0.1.0"
+description = "Single-gate ANPR autogate system (YOLO26 + PaddleOCR) for an Indonesian residential complex."
+requires-python = ">=3.10"
+
+# Exact pinned versions for reproducible local-test and field deployments.
+dependencies = [
+    "ultralytics==8.3.0",
+    # Ultralytics object tracking (model.track) needs the `lap` module from the
+    # `lapx` wheel; not pulled in by the ultralytics wheel, so pinned here.
+    "lapx==0.9.4",
+    "paddleocr==2.9.1",
+    # PaddleOCR needs the PaddlePaddle runtime engine (not pulled in by the
+    # paddleocr wheel), so it is pinned explicitly here. Must stay on 2.6.x:
+    # PaddlePaddle 3.x breaks paddleocr 2.9.1 inference with a OneDNN
+    # "fused_conv2d" error, causing OCR to silently fail at runtime.
+    "paddlepaddle==2.6.2",
+    "opencv-python==4.10.0.84",
+    "PyQt5==5.15.11",
+    "PyYAML==6.0.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.3.3",
+    "pytest-qt==4.4.0",
+    "hypothesis==6.112.1",
+]
+
+[project.scripts]
+anpr = "anpr.main:main"
+
+[tool.setuptools.packages.find]
+include = ["anpr*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra"
+markers = [
+    "property: property-based tests (Hypothesis, min 100 examples).",
+    "unit: example-based unit tests.",
+    "integration: end-to-end / multi-component integration tests.",
+    "gui: PyQt5 GUI tests (require pytest-qt).",
+    "smoke: wiring / scope / deferred-feature smoke tests.",
+]

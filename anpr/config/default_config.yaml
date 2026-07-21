@@ -1,0 +1,63 @@
+# Default configuration for the ANPR Autogate System.
+#
+# This file ships the authoritative schema and default values (design.md,
+# Configuration section). Environment variables override any matching key at
+# load time (Requirement 14.1): use the ANPR_ prefix with double-underscore
+# section separators, e.g. ANPR_CAMERA__TARGET_FPS=30 overrides camera.target_fps.
+#
+# Switching between the local-test and field environments is config-only; no
+# code changes are required (Requirement 14.2).
+
+environment:
+  label: local-test           # local-test | field
+
+camera:
+  type: webcam                # webcam | ip
+  device_index: 0
+  stream_url: ""
+  target_fps: 15              # 1..60
+  reconnect_interval_s: 5     # 1..60
+  inactivity_timeout_s: 10    # 1..30
+
+model:
+  weights_path: best.pt
+  detection_threshold: 0.5    # 0..1
+
+ocr:
+  confidence_threshold: 0.70  # 0..1
+  timeout_ms: 2000
+
+gate:
+  mode: simulation            # simulation | hardware
+  hardware_response_timeout_s: 3   # 1..30
+
+direction:
+  mode: single_camera_trajectory   # single_camera_trajectory | dual_camera
+  min_consecutive_frames: 5
+  inbound_reference_orientation: [1, 0]
+  confidence_threshold: 0.60       # 0..1
+  camera_direction_map: {}
+
+storage:
+  image_dir: ./images
+  capture_enabled: true
+  thumbnail_max_px: 320
+  retention_days: 30           # 1..365
+  retention_interval_h: 24     # 1..24
+
+database:
+  location: ./anpr.db
+
+network:
+  # Network addresses for field deployment; present in the schema per
+  # Requirements 14.2 / 14.4 so environment switching stays config-only.
+  gate_host: ""
+  gate_port: 0
+
+ui:
+  guard:
+    min_fps: 10
+    max_overlay_latency_ms: 200
+    max_update_latency_ms: 500
+    max_surfacing_latency_ms: 1000
+    manual_plate_max_len: 12
