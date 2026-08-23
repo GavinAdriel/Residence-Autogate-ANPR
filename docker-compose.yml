@@ -1,0 +1,48 @@
+# Docker Compose for the ANPR Autogate System database.
+# Usage:
+#   docker compose up -d          # start MySQL + phpMyAdmin
+#   docker compose down           # stop (data persists in the named volume)
+#   docker compose down -v        # stop and DELETE all data
+#
+# phpMyAdmin: http://localhost:8080  (log in with the credentials below)
+# MySQL:      localhost:3306
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: anpr-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: anpr
+      MYSQL_USER: anpr
+      MYSQL_PASSWORD: anprpassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Runs once on first startup (empty data dir) to create the schema.
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  phpmyadmin:
+    image: phpmyadmin:5
+    container_name: anpr-phpmyadmin
+    restart: unless-stopped
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      UPLOAD_LIMIT: 64M
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+    name: anpr_mysql_data
