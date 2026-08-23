@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: anpr
+      MYSQL_DATABASE: anpr_system
       MYSQL_USER: anpr
       MYSQL_PASSWORD: anprpassword
     ports:
