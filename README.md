@@ -84,6 +84,14 @@ anpr
 python -m anpr.main
 ```
 
+## Run Streamlit App
+
+```bash
+# work while inside or outside the env
+cd streamlit_app
+streamlit run app.py
+```
+
 The application launches the Guard Dashboard (live feed + gate control) and the Admin Dashboard (resident management + event log).
 
 ## Configuration
