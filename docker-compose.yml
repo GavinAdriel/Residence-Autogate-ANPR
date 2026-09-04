@@ -18,13 +18,21 @@ services:
       MYSQL_USER: anpr
       MYSQL_PASSWORD: anprpassword
     ports:
-      - "3306:3306"
+      - "3306:3306" #bisa ganti sesuai kebutuhan
     volumes:
       - mysql_data:/var/lib/mysql
       # Runs once on first startup (empty data dir) to create the schema.
       - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$$MYSQL_ROOT_PASSWORD"]
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-p$$MYSQL_ROOT_PASSWORD",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,7 +46,7 @@ services:
       PMA_PORT: 3306
       UPLOAD_LIMIT: 64M
     ports:
-      - "8080:80"
+      - "8080:80" #bisa ganti sesuai kebutuhan
     depends_on:
       mysql:
         condition: service_healthy
