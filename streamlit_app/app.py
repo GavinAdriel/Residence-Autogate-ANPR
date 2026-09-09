@@ -5,6 +5,7 @@ from views.monitoring import show_monitoring
 from views.residents import show_residents
 from views.vehicles import show_vehicles
 from views.anpr_logs import show_anpr_logs
+from views.vehicle_crud import show_vehicles_API
 
 st.set_page_config(
     page_title="ANPR System",
@@ -20,15 +21,17 @@ st.write(
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "📊 Dashboard",
         "🎥 Monitoring",
         "👤 Residents",
         "🚗 Vehicles",
-        "📋 ANPR Logs"
+        "📋 ANPR Logs",
+        "Vehicle API"
     ]
 )
+
 
 with tab1:
     show_dashboard()
@@ -44,6 +47,9 @@ with tab4:
 
 with tab5:
     show_anpr_logs()
+
+with tab6:
+    show_vehicles_API()
 
 
 
