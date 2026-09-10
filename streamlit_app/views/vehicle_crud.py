@@ -22,7 +22,7 @@ def show_vehicles_API():
         st.warning("Belum ada data Resident. Tambahkan Resident dulu sebelum bisa tambah Vehicle.")
 
     resident_options = {
-        r["Resident_ID"]: f"{r['Resident_ID']} - {r['Resident_Name']}" for r in residents
+        r["Resident_ID"]: f"{r['Resident_Name']}" for r in residents
     }
 
     # ---------- Load vehicle (sekali di awal) ----------

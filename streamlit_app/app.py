@@ -2,7 +2,7 @@ import streamlit as st
 
 from views.dashboard import show_dashboard
 from views.monitoring import show_monitoring
-from views.residents import show_residents
+from views.residents import show_residentsCRUD
 from views.vehicles import show_vehicles
 from views.anpr_logs import show_anpr_logs
 from views.vehicle_crud import show_vehicles_API
@@ -40,7 +40,7 @@ with tab2:
     show_monitoring()
 
 with tab3:
-    show_residents()
+    show_residentsCRUD()
 
 with tab4:
     show_vehicles()
