@@ -29,6 +29,11 @@ def create_resident(payload: schemas.ResidentCreate, db: Session = Depends(get_d
 @router.get("", response_model=List[schemas.ResidentOut])
 def list_residents(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     return db.query(models.Resident).offset(skip).limit(limit).all()
+
+##=========COUNT RESIDENT================
+@router.get("/count", response_model=int)
+def get_residents_count(db: Session = Depends(get_db)):
+    return db.query(models.Resident).count()
  
  
 @router.get("/{resident_id}", response_model=schemas.ResidentOut)

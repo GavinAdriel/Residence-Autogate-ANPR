@@ -1,11 +1,9 @@
 import streamlit as st
 
 from views.dashboard import show_dashboard
-from views.monitoring import show_monitoring
 from views.residents import show_residentsCRUD
-from views.vehicles import show_vehicles
 from views.anpr_logs import show_anpr_logs
-from views.vehicle_crud import show_vehicles_API
+from views.vehicles import show_vehicles_API
 
 st.set_page_config(
     page_title="ANPR System",
@@ -21,14 +19,12 @@ st.write(
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
         "📊 Dashboard",
-        "🎥 Monitoring",
         "👤 Residents",
         "🚗 Vehicles",
         "📋 ANPR Logs",
-        "Vehicle API"
     ]
 )
 
@@ -37,19 +33,14 @@ with tab1:
     show_dashboard()
 
 with tab2:
-    show_monitoring()
-
-with tab3:
     show_residentsCRUD()
 
-with tab4:
-    show_vehicles()
+with tab3:
+    show_vehicles_API()
 
-with tab5:
+with tab4:
     show_anpr_logs()
 
-with tab6:
-    show_vehicles_API()
 
 
 
@@ -150,39 +141,3 @@ with st.sidebar:
     st.caption("v1.0.0")
 
 
-
-# ==============================
-# PAGE ROUTER
-# ==============================
-
-# if page == "Dashboard":
-#     from pages.dashboard import show_dashboard
-#     show_dashboard()
-
-# elif page == "Monitoring":
-#     from pages.monitoring import show_monitoring
-#     show_monitoring()
-
-# elif page == "Residents":
-#     from pages.residents import show_residents
-#     show_residents()
-
-# elif page == "Vehicles":
-#     from pages.vehicles import show_vehicles
-#     show_vehicles()
-
-# elif page == "Cameras":
-#     from pages.cameras import show_cameras
-#     show_cameras()
-
-# elif page == "ANPR Logs":
-#     from pages.anpr_logs import show_anpr_logs
-#     show_anpr_logs()
-
-# elif page == "Users":
-#     from pages.users import show_users
-#     show_users()
-
-# elif page == "Settings":
-#     from pages.settings import show_settings
-#     show_settings()

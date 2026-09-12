@@ -30,6 +30,11 @@ def create_vehicle(payload: schemas.VehicleCreate, db: Session = Depends(get_db)
 def list_vehicles(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     return db.query(models.Vehicle).offset(skip).limit(limit).all()
 
+##=========COUNT VEHICLE================
+@router.get("/count", response_model=int)
+def get_vehicles_count(db: Session = Depends(get_db)):
+    return db.query(models.Vehicle).count()
+
 
 @router.get("/{vehicle_id}", response_model=schemas.VehicleOut)
 def get_vehicle(vehicle_id: int, db: Session = Depends(get_db)):

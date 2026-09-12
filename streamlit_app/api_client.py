@@ -15,7 +15,12 @@ def get_residents():
     res = requests.get(f"{API_URL}/residents")
     res.raise_for_status()
     return res.json()
- 
+
+##========COUNT RESIDENT======
+def get_total_residents_count():
+    res = requests.get(f"{API_URL}/residents/count")
+    res.raise_for_status()
+    return res.json() 
  
 def create_resident(data: dict):
     res = requests.post(f"{API_URL}/residents", json=data)
@@ -38,6 +43,12 @@ def delete_resident(resident_id: int):
  
 def get_vehicles():
     res = requests.get(f"{API_URL}/vehicles")
+    res.raise_for_status()
+    return res.json()
+
+
+def get_total_vehicles_count():
+    res = requests.get(f"{API_URL}/vehicles/count")
     res.raise_for_status()
     return res.json()
  
