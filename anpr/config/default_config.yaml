@@ -31,13 +31,6 @@ gate:
   mode: simulation            # simulation | hardware
   hardware_response_timeout_s: 3   # 1..30
 
-direction:
-  mode: single_camera_trajectory   # single_camera_trajectory | dual_camera
-  min_consecutive_frames: 5
-  inbound_reference_orientation: [1, 0]
-  confidence_threshold: 0.60       # 0..1
-  camera_direction_map: {}
-
 storage:
   image_dir: ./images
   capture_enabled: true
@@ -46,7 +39,11 @@ storage:
   retention_interval_h: 24     # 1..24
 
 database:
-  location: ./anpr.db // localhost:3306
+  host: 127.0.0.1        # localhost only (Req 1.6)
+  port: 3306             # matches docker-compose published port
+  name: anpr             # MYSQL_DATABASE
+  user: anpr             # MYSQL_USER
+  password: anprpassword # MYSQL_PASSWORD; overridable via ANPR_DATABASE__PASSWORD
 
 network:
   # Network addresses for field deployment; present in the schema per

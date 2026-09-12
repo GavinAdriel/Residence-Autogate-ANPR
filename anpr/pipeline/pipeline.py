@@ -3,10 +3,10 @@
 :class:`DetectionPipeline` drives the whole ingest-to-decision flow at the
 configured frame rate. It is the orchestration seam that wires together the
 thin :class:`~anpr.core.interfaces.VideoSource`, the ``VehicleDetector``, the
-``OcrEngine``, the ``PlateNormalizer``, the ``DirectionResolver`` and the
-``AccessController`` -- depending only on their Protocol interfaces so mock and
-field implementations stay structurally interchangeable and are selected purely
-by configuration in the composition root (Requirement 14.4).
+``OcrEngine``, the ``PlateNormalizer`` and the ``AccessController`` -- depending
+only on their Protocol interfaces so mock and field implementations stay
+structurally interchangeable and are selected purely by configuration in the
+composition root (Requirement 14.4).
 
 Responsibilities implemented here (task 12.2):
 
@@ -30,9 +30,9 @@ Responsibilities implemented here (task 12.2):
 * **Format gating** -- when normalization marks a plate format-invalid, surface
   the raw text together with the rejection reason for manual confirmation
   (Req 4.5).
-* **Routing** -- route a format-valid, confident, inbound detection through the
-  direction resolver into the ``AccessController``; surface direction-
-  undetermined events for manual resolution (Req 7.4).
+* **Routing** -- route a format-valid, confident detection directly through the
+  ``AccessController``'s flat match-and-log; direction resolution is retired in
+  the monitoring migration (Req 5.1, 7.2-7.4).
 * **Event assembly** -- build a :class:`~anpr.core.models.DetectionEvent`
   accumulating the detection and OCR confidences and the end-to-end processing
   latency (frame acquisition -> access decision) (design Event flow, Req 15.1).
@@ -44,7 +44,7 @@ deterministically with a fake clock and a mock :class:`VideoSource` without any
 real camera, model, or wall-clock delay. Events surfaced for manual handling are
 exposed both via an injectable callback and via the
 :attr:`DetectionPipeline.manual_review_queue`, so the Guard_Dashboard task can
-consume them (Req 3.3, 3.4, 3.5, 4.5, 7.4).
+consume them (Req 3.3, 3.4, 3.5, 4.5).
 
 See .kiro/specs/anpr-autogate-system/design.md (DetectionPipeline section) and
 requirements.md (Requirements 1, 3) for the authoritative acceptance criteria.
@@ -69,13 +69,9 @@ from anpr.core.models import (
     BoundingBox,
     Detection,
     DetectionEvent,
-    DirectionOutcome,
     OcrResult,
-    Point,
-    TrackHistory,
 )
 from anpr.core.normalizer import PlateNormalizer
-from anpr.direction.resolver import DirectionResolver
 from anpr.pipeline.video_source import SourceUnavailable
 
 logger = logging.getLogger(__name__)
@@ -118,9 +114,6 @@ REVIEW_OCR_LOW_CONFIDENCE = (
     "for manual confirmation."
 )
 REVIEW_FORMAT_INVALID = "Plate is format-invalid; surfaced for manual confirmation."
-REVIEW_DIRECTION_UNDETERMINED = (
-    "Travel direction is undetermined; surfaced for manual resolution."
-)
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -166,8 +159,6 @@ class DetectionPipeline:
         The OCR engine wrapping PaddleOCR.
     normalizer:
         The pure plate normalizer.
-    direction_resolver:
-        The configured direction resolver (single-camera trajectory this phase).
     access_controller:
         The access-control orchestrator that classifies, drives the gate, and
         logs the access attempt.
@@ -177,7 +168,7 @@ class DetectionPipeline:
         configuration via :meth:`from_config`.
     on_manual_review:
         Optional callback invoked with each event surfaced for manual handling
-        (Req 3.3, 3.4, 3.5, 4.5, 7.4). Every such event is also appended to
+        (Req 3.3, 3.4, 3.5, 4.5). Every such event is also appended to
         :attr:`manual_review_queue`.
     on_event:
         Optional callback invoked with every fully assembled
@@ -192,7 +183,6 @@ class DetectionPipeline:
         detector: VehicleDetector,
         ocr_engine: OcrEngine,
         normalizer: PlateNormalizer,
-        direction_resolver: DirectionResolver,
         access_controller: AccessController,
         *,
         target_fps: float = DEFAULT_TARGET_FPS,
@@ -211,7 +201,6 @@ class DetectionPipeline:
         self._detector = detector
         self._ocr = ocr_engine
         self._normalizer = normalizer
-        self._direction = direction_resolver
         self._access = access_controller
 
         self._target_fps = _clamp(float(target_fps), MIN_TARGET_FPS, MAX_TARGET_FPS)
@@ -243,9 +232,6 @@ class DetectionPipeline:
         self._last_activity: Optional[float] = None
         self._last_cycle: Optional[float] = None
 
-        # Per-track centroid history for the single-camera trajectory resolver.
-        self._track_histories: dict[int, TrackHistory] = {}
-
         # Events awaiting a guard decision; retained until the guard resolves
         # them (Req 12.7 -- surfacing side implemented here).
         self.manual_review_queue: Deque[DetectionEvent] = deque()
@@ -269,7 +255,6 @@ class DetectionPipeline:
         detector: VehicleDetector,
         ocr_engine: OcrEngine,
         normalizer: PlateNormalizer,
-        direction_resolver: DirectionResolver,
         access_controller: AccessController,
         **overrides: Any,
     ) -> "DetectionPipeline":
@@ -287,7 +272,6 @@ class DetectionPipeline:
             detector,
             ocr_engine,
             normalizer,
-            direction_resolver,
             access_controller,
             target_fps=_cfg(config, "camera.target_fps", DEFAULT_TARGET_FPS),
             reconnect_interval_s=_cfg(
@@ -508,17 +492,17 @@ class DetectionPipeline:
         self._last_cycle = self._monotonic()
 
     # ------------------------------------------------------------------
-    # Frame processing (Req 3.1, 3.3, 3.4, 3.5, 4.5, 7.x)
+    # Frame processing (Req 3.1, 3.3, 3.4, 3.5, 4.5, 5.1, 7.x)
     # ------------------------------------------------------------------
     def process_frame(self, frame: Any, acquired_at: float) -> list[DetectionEvent]:
-        """Detect, crop, read, normalize, resolve, and route one frame.
+        """Detect, crop, read, normalize, and route one frame.
 
         Runs the detector, then for each retained detection box crops exactly
         one region (Req 3.1), reads it with the OCR engine under the OCR timeout
         (Req 3.5), and gates the result through OCR-failure / low-confidence /
-        format-invalid / direction handling, assembling a
-        :class:`DetectionEvent` per detection with accumulated confidences and
-        end-to-end latency. An empty frame yields no events (Req 2.3).
+        format-invalid handling, assembling a :class:`DetectionEvent` per
+        detection with accumulated confidences and end-to-end latency. An empty
+        frame yields no events (Req 2.3).
         """
         detections = self._detector.detect(frame)
 
@@ -537,7 +521,13 @@ class DetectionPipeline:
     def _process_detection(
         self, frame: Any, detection: Detection, acquired_at: float
     ) -> DetectionEvent:
-        """Process one retained detection into a routed / surfaced event."""
+        """Process one retained detection into a routed / surfaced event.
+
+        A confident, format-valid reading is routed directly through
+        :meth:`AccessController.handle_detection` (Req 5.1, 7.2-7.4); OCR
+        failures, low-confidence reads, and format-invalid plates are surfaced
+        for manual handling instead.
+        """
         event = DetectionEvent(
             timestamp=self._wall_clock(),
             acquired_at=self._wall_clock_from_monotonic(acquired_at),
@@ -582,60 +572,14 @@ class DetectionPipeline:
             reason = normalization.reason or REVIEW_FORMAT_INVALID
             return self._surface(event, acquired_at, reason)
 
-        # Direction resolution over the accumulated track history.
-        track = self._update_track_history(detection)
-        event.track = track
-        direction = self._direction.resolve(track)
-        event.direction = direction
-
-        if direction == DirectionOutcome.INBOUND:
-            self._finalize_latency(event, acquired_at)
-            decision = self._access.handle_inbound(event)
-            self._apply_decision(event, decision)
-            self._emit(event)
-            return event
-
-        if direction == DirectionOutcome.OUTBOUND:
-            # Outbound trajectory resolution is deferred this phase; the
-            # access-control logic exists and is exercised when fed an outbound
-            # event (design Phase Scope). Route it through so the outbound flow
-            # stays wired.
-            self._finalize_latency(event, acquired_at)
-            decision = self._access.handle_outbound(event)
-            self._apply_decision(event, decision)
-            self._emit(event)
-            return event
-
-        # Req 7.4: direction-undetermined applies no direction-specific rules
-        # and is surfaced for manual resolution.
-        return self._surface(event, acquired_at, REVIEW_DIRECTION_UNDETERMINED)
-
-    # ------------------------------------------------------------------
-    # Track history
-    # ------------------------------------------------------------------
-    def _update_track_history(self, detection: Detection) -> TrackHistory:
-        """Append this detection's centroid to its track history.
-
-        Maintains a per-``track_id`` centroid trail so the single-camera
-        trajectory resolver has the consecutive frames it needs (Req 7.3). A
-        detection without a tracker id gets a fresh single-point history (which
-        the resolver treats as undetermined). The track's confidence is set to
-        the latest detection confidence as a proxy alignment weight.
-        """
-        centroid = _centroid(detection.box)
-        track_id = detection.track_id
-        if track_id is None:
-            return TrackHistory(
-                track_id=-1, centroids=[centroid], confidence=detection.confidence
-            )
-
-        history = self._track_histories.get(track_id)
-        if history is None:
-            history = TrackHistory(track_id=track_id, centroids=[])
-            self._track_histories[track_id] = history
-        history.centroids.append(centroid)
-        history.confidence = detection.confidence
-        return history
+        # Req 5.1 / 7.2-7.4: a confident, format-valid reading is routed
+        # directly through the access controller's flat match-and-log; direction
+        # resolution is retired in the monitoring migration.
+        self._finalize_latency(event, acquired_at)
+        decision = self._access.handle_detection(event)
+        self._apply_decision(event, decision)
+        self._emit(event)
+        return event
 
     # ------------------------------------------------------------------
     # Surfacing / emitting
@@ -643,7 +587,7 @@ class DetectionPipeline:
     def _surface(
         self, event: DetectionEvent, acquired_at: float, reason: str
     ) -> DetectionEvent:
-        """Mark an event for manual handling and surface it (Req 3.3-4.5, 7.4).
+        """Mark an event for manual handling and surface it (Req 3.3-4.5).
 
         Finalizes the end-to-end latency, flags the event for the manual-review
         queue, appends it, notifies the optional callback, and emits it on the
@@ -734,11 +678,6 @@ class DetectionPipeline:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-
-def _centroid(box: BoundingBox) -> Point:
-    """Return the integer pixel centroid ``(cx, cy)`` of a bounding box."""
-    return ((box.x1 + box.x2) // 2, (box.y1 + box.y2) // 2)
 
 
 def _cfg(config: Any, key: str, default: Any) -> Any:

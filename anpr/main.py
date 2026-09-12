@@ -3,39 +3,41 @@
 This is the single place where configuration is read and concrete component
 implementations are selected and wired together (Requirement 14.2, 14.4). No
 core component imports a concrete peer implementation: every concrete choice --
-which :class:`VideoSource`, which :class:`GateController`, which
-:class:`DirectionResolver`, the SQLite repositories, and the image store -- is
-made here from configuration values alone.
+which :class:`VideoSource`, which :class:`GateController`, the MySQL
+repositories, and the image store -- is made here from configuration values
+alone. The running system is reduced to the Guard monitoring surface only; no
+direction resolver and no Admin dashboard are wired (Req 6.2, 6.3).
 
-Startup ordering (see design.md "Architecture" and Requirements 2.1, 14.5):
+Startup ordering (see design.md "Startup ordering" and Requirements 9.6, 14.5):
 
 1. Load configuration through the :class:`~anpr.config.provider.ConfigProvider`
    and run :meth:`ConfigProvider.validate`. Every reported
    :class:`~anpr.core.models.ConfigError` is logged naming the offending
    setting, and startup is refused so an affected component never starts with a
    missing/invalid required value (Req 14.5).
-2. Build the persistence layer (a shared SQLite :class:`Database` plus the
-   resident and event-log repositories) from ``database.location``.
-3. Build the image store from ``storage.*``.
+2. Connect to MySQL from ``database.{host,port,name,user,password}`` (eager,
+   10-second connect timeout) and verify the required tables are present; a
+   connect failure or a missing table halts startup (Req 1.4, 1.5, 9.7).
+3. Build the persistence repositories (MySQL-backed resident + event-log) and
+   the image store from ``storage.*`` over the shared connection.
 4. Select the video source from ``camera.type`` (Req 1.2, 1.3).
 5. Select the gate from ``gate.mode`` (Req 6.4).
-6. Select the direction resolver from ``direction.mode`` (Req 7.1).
-7. Load the detector weights *before* the first frame / before the pipeline
+6. Load the detector weights *before* the first frame / before the pipeline
    starts; on a weights-load failure log the offending path and halt pipeline
    startup (Req 2.1, 2.5).
-8. Construct the :class:`~anpr.pipeline.pipeline.DetectionPipeline`, wiring the
-   detector, OCR engine, normalizer, direction resolver, access controller,
-   repositories, gate, and image store.
-9. Launch the Guard and Admin dashboards and start the ingest loop.
+7. Construct the :class:`~anpr.pipeline.pipeline.DetectionPipeline`, wiring the
+   detector, OCR engine, normalizer, access controller, repositories, gate, and
+   image store.
+8. Launch the Guard dashboard and start the ingest loop.
 
 Offline by default (Req 14.3): the composition root performs no outbound cloud
-or internet connection; the only network egress is the optional IP-camera
-stream selected via ``camera.type = ip``.
+or internet connection; the only network egress is the local MySQL connection
+and the optional IP-camera stream selected via ``camera.type = ip``.
 
 The non-GUI builders and :func:`build_application` are deliberately free of any
-PyQt5 dependency so the wiring can be exercised headlessly; the dashboards are
-constructed only inside :func:`main`, behind the same guarded PyQt5 import used
-elsewhere in the codebase.
+PyQt5 dependency so the wiring can be exercised headlessly; the Guard dashboard
+is constructed only inside :func:`main`, behind the same guarded PyQt5 import
+used elsewhere in the codebase.
 """
 
 from __future__ import annotations
@@ -47,7 +49,6 @@ from typing import Any, Callable, Optional
 from anpr.config.provider import ConfigProvider
 from anpr.core.access_controller import AccessController
 from anpr.core.interfaces import (
-    DirectionResolver,
     EventLogRepository,
     GateController,
     ImageStore,
@@ -63,7 +64,6 @@ from anpr.detection.detector import (
     WeightsLoadError,
     YoloVehicleDetector,
 )
-from anpr.direction.resolver import create_direction_resolver
 from anpr.gate.controller import (
     DEFAULT_RESPONSE_TIMEOUT_S,
     HardwareGate,
@@ -72,9 +72,9 @@ from anpr.gate.controller import (
 )
 from anpr.imaging.store import DiskImageStore, create_image_store
 from anpr.ocr.engine import PaddleOcrEngine
-from anpr.persistence.db import Database
-from anpr.persistence.event_log_repo import SqliteEventLogRepository
-from anpr.persistence.resident_repo import SqliteResidentRepository
+from anpr.persistence.db import Database, MissingTableError
+from anpr.persistence.event_log_repo import MySqlEventLogRepository
+from anpr.persistence.resident_repo import MySqlResidentRepository
 from anpr.pipeline.pipeline import DetectionPipeline
 from anpr.pipeline.video_source import IpCameraVideoSource, WebcamVideoSource
 
@@ -211,29 +211,50 @@ def build_gate(
     )
 
 
-def build_direction_resolver(config: ConfigProvider) -> DirectionResolver:
-    """Select the direction resolver from ``direction.mode`` (Req 7.1, 14.4)."""
-    try:
-        return create_direction_resolver(config)
-    except ValueError as exc:
-        # create_direction_resolver raises ValueError on an unsupported mode.
-        raise StartupError(str(exc)) from exc
-
-
 def build_repositories(
     config: ConfigProvider,
 ) -> tuple[Database, ResidentRepository, EventLogRepository]:
-    """Build the shared SQLite database and its repositories (Req 14.2).
+    """Build the shared MySQL database and its repositories (Req 9.1).
 
-    A single :class:`Database` connection (from ``database.location``) is shared
-    by both repositories so they use the same schema and connection. Persistence
-    is a local SQLite file -- no network access (Req 14.3).
+    A single :class:`Database` connection (from ``database.{host,port,name,user,
+    password}``) is shared by both repositories so they use the same connection,
+    access lock, and liveness check. The connection is opened eagerly with a
+    10-second connect timeout (Req 1.1); once connected, the required tables are
+    verified before startup proceeds (Req 1.5, 9.6).
+
+    A connect failure raises :class:`ConnectionError` and a missing table raises
+    :class:`MissingTableError`; both are mapped here to :class:`StartupError`
+    (logging the configured host/port and the missing table name respectively)
+    so no partially-wired system starts (Req 1.4, 1.5, 9.7). The only egress is
+    the local MySQL connection over the configured address (Req 14.3).
     """
-    location = str(_cfg(config, "database.location", "./anpr.db"))
-    logger.info("Opening SQLite database at %r.", location)
-    database = Database(location)
-    resident_repo = SqliteResidentRepository(database)
-    event_log_repo = SqliteEventLogRepository(database)
+    host = str(_cfg(config, "database.host", "127.0.0.1"))
+    port = int(_cfg(config, "database.port", 3306))
+    name = str(_cfg(config, "database.name", "anpr"))
+    user = str(_cfg(config, "database.user", "anpr"))
+    password = str(_cfg(config, "database.password", ""))
+
+    logger.info("Connecting to MySQL at %s:%d (database %r).", host, port, name)
+    try:
+        database = Database(
+            host=host, port=port, name=name, user=user, password=password
+        )
+    except ConnectionError as exc:
+        logger.error("Cannot connect to MySQL at %s:%d: %s", host, port, exc)
+        raise StartupError(
+            f"Cannot connect to MySQL at {host}:{port}: {exc}"
+        ) from exc
+
+    # Verify the externally-owned schema is present before wiring anything
+    # onto it (Req 1.5, 9.6).
+    try:
+        database.check_required_tables()
+    except MissingTableError as exc:
+        logger.error("Required MySQL table missing: %s", exc)
+        raise StartupError(str(exc)) from exc
+
+    resident_repo = MySqlResidentRepository(database)
+    event_log_repo = MySqlEventLogRepository(database)
     return database, resident_repo, event_log_repo
 
 
@@ -300,7 +321,6 @@ def build_pipeline(
     detector: YoloVehicleDetector,
     ocr_engine: OcrEngine,
     normalizer: PlateNormalizer,
-    direction_resolver: DirectionResolver,
     access_controller: AccessController,
     *,
     on_event: Optional[Callable[[Any], None]] = None,
@@ -318,7 +338,6 @@ def build_pipeline(
         detector,
         ocr_engine,
         normalizer,
-        direction_resolver,
         access_controller,
         on_event=on_event,
         on_manual_review=on_manual_review,
@@ -345,7 +364,6 @@ class Application:
     image_store: DiskImageStore
     video_source: VideoSource
     gate: GateController
-    direction_resolver: DirectionResolver
     normalizer: PlateNormalizer
     detector: YoloVehicleDetector
     ocr_engine: OcrEngine
@@ -365,11 +383,13 @@ def build_application(
     """Read configuration and wire the whole non-GUI object graph in order.
 
     Runs the startup ordering documented in the module docstring: validate
-    configuration (Req 14.5), build persistence/imaging, select the video
-    source/gate/direction resolver purely from config (Req 14.2, 14.4), load the
-    detector weights before the pipeline is constructed (Req 2.1), then assemble
-    the pipeline. Raises :class:`StartupError` when configuration is invalid, a
-    selector value is unsupported, or the detector weights cannot be loaded.
+    configuration (Req 14.5), connect to MySQL and verify tables, build
+    persistence/imaging, select the video source/gate purely from config
+    (Req 14.2, 14.4), load the detector weights before the pipeline is
+    constructed (Req 2.1), then assemble the pipeline. Raises
+    :class:`StartupError` when configuration is invalid, MySQL cannot be reached
+    or a required table is missing, a selector value is unsupported, or the
+    detector weights cannot be loaded.
 
     ``load_weights`` may be set ``False`` for headless wiring tests that inject a
     detector model factory of their own.
@@ -380,14 +400,14 @@ def build_application(
     validate_config_or_halt(config)
     environment_label = resolve_environment_label(config)
 
-    # Step 2-3: persistence + imaging (local SQLite/disk only, Req 14.3).
+    # Step 2-3: connect to MySQL + verify tables, then persistence + imaging
+    # over the shared connection (local MySQL/disk only, Req 14.3).
     database, resident_repo, event_log_repo = build_repositories(config)
     image_store = build_image_store(config, database)
 
-    # Step 4-6: concrete selection purely from config (Req 14.2, 14.4).
+    # Step 4-5: concrete selection purely from config (Req 14.2, 14.4).
     video_source = build_video_source(config)
     gate = build_gate(config, hardware_interface=hardware_interface)
-    direction_resolver = build_direction_resolver(config)
 
     # Pure collaborators.
     normalizer = PlateNormalizer()
@@ -396,20 +416,19 @@ def build_application(
         resident_repo, event_log_repo, gate, environment_label
     )
 
-    # Step 7: load detector weights BEFORE constructing/starting the pipeline
+    # Step 6: load detector weights BEFORE constructing/starting the pipeline
     # so the first frame is never processed against unloaded weights (Req 2.1).
     detector = build_detector(config)
     if load_weights:
         load_detector_weights_or_halt(detector)
 
-    # Step 8: assemble the pipeline over the abstractions.
+    # Step 7: assemble the pipeline over the abstractions.
     pipeline = build_pipeline(
         config,
         video_source,
         detector,
         ocr_engine,
         normalizer,
-        direction_resolver,
         access_controller,
         on_event=on_event,
         on_manual_review=on_manual_review,
@@ -424,7 +443,6 @@ def build_application(
         image_store=image_store,
         video_source=video_source,
         gate=gate,
-        direction_resolver=direction_resolver,
         normalizer=normalizer,
         detector=detector,
         ocr_engine=ocr_engine,
@@ -434,7 +452,7 @@ def build_application(
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint (GUI): launches the Guard and Admin dashboards + ingest loop
+# Entrypoint (GUI): launches the Guard dashboard + ingest loop
 # ---------------------------------------------------------------------------
 def _configure_logging() -> None:
     """Configure basic console logging when the app owns the root logger."""
@@ -450,13 +468,13 @@ def main(
     *,
     hardware_interface: Optional[HardwareInterface] = None,
 ) -> int:
-    """Compose the system, launch the dashboards, and run the ingest loop.
+    """Compose the system, launch the Guard dashboard, and run the ingest loop.
 
     Wires the non-GUI object graph in the documented startup order, constructs
-    the Guard and Admin dashboards behind a guarded PyQt5 import, marshals the
-    pipeline's live-feed and manual-review callbacks onto the GUI thread via a
-    Qt signal bridge, starts the :class:`DetectionPipeline` on a background
-    thread, and runs the Qt event loop. Returns the Qt exit code.
+    the Guard dashboard behind a guarded PyQt5 import, marshals the pipeline's
+    live-feed and manual-review callbacks onto the GUI thread via a Qt signal
+    bridge, starts the :class:`DetectionPipeline` on a background thread, and
+    runs the Qt event loop. Returns the Qt exit code.
 
     Raises :class:`StartupError` when configuration is invalid, a selector value
     is unsupported, the detector weights cannot be loaded, or PyQt5 is not
@@ -482,11 +500,10 @@ def main(
         from PyQt5.QtWidgets import QApplication
     except ModuleNotFoundError as exc:  # pragma: no cover - only pre-install
         raise StartupError(
-            "PyQt5 is required to launch the Guard and Admin dashboards but is "
+            "PyQt5 is required to launch the Guard dashboard but is "
             f"not installed: {exc}"
         ) from exc
 
-    from anpr.ui.admin_dashboard import AdminDashboard
     from anpr.ui.guard_dashboard import GuardDashboard
 
     # --- Configuration + non-GUI components (Req 14.2, 14.4, 14.5) ----------
@@ -498,7 +515,6 @@ def main(
     image_store = build_image_store(config, database)
     video_source = build_video_source(config)
     gate = build_gate(config, hardware_interface=hardware_interface)
-    direction_resolver = build_direction_resolver(config)
     normalizer = PlateNormalizer()
     ocr_engine = build_ocr_engine(config)
     access_controller = build_access_controller(
@@ -534,7 +550,6 @@ def main(
         detector,
         ocr_engine,
         normalizer,
-        direction_resolver,
         access_controller,
         on_event=bridge.detection.emit,
         on_manual_review=bridge.review.emit,
@@ -549,7 +564,6 @@ def main(
         environment_label=environment_label,
         frame_provider=pipeline.latest_feed,
     )
-    admin_dashboard = AdminDashboard(resident_repo, normalizer, config=config)
 
     bridge.detection.connect(guard_dashboard.on_detection)
     bridge.review.connect(
@@ -559,7 +573,6 @@ def main(
     )
 
     guard_dashboard.show()
-    admin_dashboard.show()
 
     # Start polling the pipeline's latest frame so the live feed renders
     # continuously at >= the configured min fps (Req 12.1).

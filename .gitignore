@@ -21,6 +21,8 @@ ENV/
 
 # ANPR project specific
 anpr/images/
+# Runtime capture output (storage.image_dir in default_config.yaml)
+/images/
 *.db
 best.pt
 
@@ -30,6 +32,9 @@ Thumbs.db
 
 # pytest
 .pytest_cache/
+
+# Hypothesis local example database / cache
+.hypothesis/
 
 # Kiro
 .kiro/

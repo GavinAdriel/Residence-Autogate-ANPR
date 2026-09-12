@@ -1,15 +1,20 @@
-"""Unit tests for the DetectionPipeline ingest -> decision loop (Task 12.2).
+"""Unit tests for the DetectionPipeline ingest -> decision loop.
 
 These example-based tests exercise the pipeline's throttling, connect/reconnect
 behavior, cropping, OCR gating, normalization gating, and routing using injected
-fakes (a mock ``VideoSource``, detector, OCR engine, direction resolver, and
-access controller) and a fake clock, so no real camera, model, or wall-clock
-delay is needed.
+fakes (a mock ``VideoSource``, detector, OCR engine, and access controller) and
+a fake clock, so no real camera, model, or wall-clock delay is needed.
+
+Direction resolution is retired in the monitoring migration: a confident,
+format-valid reading is routed directly through
+:meth:`AccessController.handle_detection` (Req 5.1), with no direction resolver
+in the pipeline.
 
 Covers Requirements 1.1 (throttle), 1.4/1.5/1.6 (connect/reconnect/inactivity),
 3.1 (one crop per box), 3.3/3.5 (OCR failure surfacing), 3.4 (low-confidence
-gating), 4.5 (format-invalid surfacing), and the direction -> access-control
-routing with end-to-end latency assembly.
+gating), 4.5 (format-invalid surfacing), 5.1 (flat match-and-log routing),
+7.5/7.6/7.7 (surfacing retention + reconnect/inactivity), and the end-to-end
+latency assembly.
 """
 
 from __future__ import annotations
@@ -24,14 +29,12 @@ from anpr.core.models import (
     BoundingBox,
     Classification,
     Detection,
-    DirectionOutcome,
     GrantMethod,
     OcrResult,
 )
 from anpr.core.normalizer import PlateNormalizer
 from anpr.pipeline.pipeline import (
     DetectionPipeline,
-    REVIEW_DIRECTION_UNDETERMINED,
     REVIEW_FORMAT_INVALID,
     REVIEW_OCR_LOW_CONFIDENCE,
     REVIEW_OCR_NO_TEXT,
@@ -114,18 +117,8 @@ class FakeOcr:
         return self._result
 
 
-class FakeDirectionResolver:
-    """Direction resolver returning a fixed outcome."""
-
-    def __init__(self, outcome: DirectionOutcome) -> None:
-        self._outcome = outcome
-
-    def resolve(self, track) -> DirectionOutcome:
-        return self._outcome
-
-
 class FakeAccessController:
-    """Access controller recording inbound/outbound calls."""
+    """Access controller recording flat ``handle_detection`` calls."""
 
     def __init__(self, decision: AccessDecision | None = None) -> None:
         self._decision = decision or AccessDecision(
@@ -133,15 +126,10 @@ class FakeAccessController:
             grant_method=GrantMethod.AUTOMATIC,
             gate_requested=True,
         )
-        self.inbound_events: list = []
-        self.outbound_events: list = []
+        self.detection_events: list = []
 
-    def handle_inbound(self, ev) -> AccessDecision:
-        self.inbound_events.append(ev)
-        return self._decision
-
-    def handle_outbound(self, ev) -> AccessDecision:
-        self.outbound_events.append(ev)
+    def handle_detection(self, ev) -> AccessDecision:
+        self.detection_events.append(ev)
         return self._decision
 
 
@@ -163,7 +151,6 @@ def make_pipeline(
     source=None,
     detector=None,
     ocr=None,
-    resolver=None,
     access=None,
     clock=None,
     ocr_invoker=_NOT_PROVIDED,
@@ -173,7 +160,6 @@ def make_pipeline(
     source = source or FakeSource()
     detector = detector or FakeDetector()
     ocr = ocr or FakeOcr(OcrResult(text="B1234CD", confidence=0.9))
-    resolver = resolver or FakeDirectionResolver(DirectionOutcome.INBOUND)
     access = access or FakeAccessController()
 
     kwargs = dict(
@@ -194,11 +180,10 @@ def make_pipeline(
         detector,
         ocr,
         PlateNormalizer(),
-        resolver,
         access,
         **kwargs,
     )
-    return pipeline, clock, source, detector, ocr, resolver, access
+    return pipeline, clock, source, detector, ocr, access
 
 
 def a_frame(width=200, height=100):
@@ -236,7 +221,6 @@ def test_from_config_reads_camera_and_ocr_settings():
         FakeDetector(),
         FakeOcr(OcrResult(text="B1CD", confidence=0.9)),
         PlateNormalizer(),
-        FakeDirectionResolver(DirectionOutcome.INBOUND),
         FakeAccessController(),
     )
     assert pipeline.target_fps == 30
@@ -320,7 +304,7 @@ def test_ensure_connected_stops_retrying_when_pipeline_stopped():
 
 
 # ---------------------------------------------------------------------------
-# Reconnect on inactivity / interruption (Req 1.5, 1.6)
+# Reconnect on inactivity / interruption (Req 7.6, 7.7)
 # ---------------------------------------------------------------------------
 
 
@@ -413,7 +397,7 @@ def test_empty_frame_yields_no_events():
 
 
 # ---------------------------------------------------------------------------
-# OCR failure surfacing (Req 3.3, 3.5)
+# OCR failure surfacing (Req 3.3, 3.5, 7.5)
 # ---------------------------------------------------------------------------
 
 
@@ -421,7 +405,10 @@ def test_empty_frame_yields_no_events():
 def test_ocr_no_text_surfaces_for_manual_entry_and_retains_crop():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=1)
     ocr = FakeOcr(OcrResult(text=None, confidence=0.0))
-    pipeline, *_ = make_pipeline(detector=FakeDetector([detection]), ocr=ocr)
+    access = FakeAccessController()
+    pipeline, *_ = make_pipeline(
+        detector=FakeDetector([detection]), ocr=ocr, access=access
+    )
 
     frame = a_frame()
     [event] = pipeline.process_frame(frame, acquired_at=0.0)
@@ -429,6 +416,8 @@ def test_ocr_no_text_surfaces_for_manual_entry_and_retains_crop():
     assert event.needs_manual_review is True
     assert event.manual_review_reason == REVIEW_OCR_NO_TEXT
     assert list(pipeline.manual_review_queue) == [event]
+    # Surfaced without ever reaching the access controller (Req 7.2/7.3).
+    assert access.detection_events == []
     # Crop retained on the event for manual entry (Req 3.3).
     expected = frame[0:10, 0:20]
     assert np.array_equal(event.retained_crop, expected)
@@ -438,13 +427,17 @@ def test_ocr_no_text_surfaces_for_manual_entry_and_retains_crop():
 def test_ocr_timeout_surfaces_for_manual_entry():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=1)
     ocr = FakeOcr(OcrResult(text=None, confidence=0.0, timed_out=True))
-    pipeline, *_ = make_pipeline(detector=FakeDetector([detection]), ocr=ocr)
+    access = FakeAccessController()
+    pipeline, *_ = make_pipeline(
+        detector=FakeDetector([detection]), ocr=ocr, access=access
+    )
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
 
     assert event.ocr_timed_out is True
     assert event.needs_manual_review is True
     assert event.manual_review_reason == REVIEW_OCR_TIMEOUT
+    assert access.detection_events == []
 
 
 @pytest.mark.unit
@@ -477,8 +470,12 @@ def test_default_ocr_invoker_times_out_a_slow_read():
 def test_confidence_strictly_below_threshold_is_low_confidence():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=1)
     ocr = FakeOcr(OcrResult(text="B1234CD", confidence=0.69))  # below 0.70
+    access = FakeAccessController()
     pipeline, *_ = make_pipeline(
-        detector=FakeDetector([detection]), ocr=ocr, ocr_confidence_threshold=0.70
+        detector=FakeDetector([detection]),
+        ocr=ocr,
+        access=access,
+        ocr_confidence_threshold=0.70,
     )
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
@@ -486,6 +483,8 @@ def test_confidence_strictly_below_threshold_is_low_confidence():
     assert event.needs_manual_review is True
     assert event.manual_review_reason == REVIEW_OCR_LOW_CONFIDENCE
     assert event.ocr_confidence == 0.69  # text + confidence retained
+    # Low-confidence reads never reach the access controller (Req 7.4).
+    assert access.detection_events == []
 
 
 @pytest.mark.unit
@@ -504,11 +503,11 @@ def test_confidence_exactly_at_threshold_is_not_low_confidence():
 
     # At/above threshold is retained and routed, not surfaced as low-confidence.
     assert event.manual_review_reason != REVIEW_OCR_LOW_CONFIDENCE
-    assert len(access.inbound_events) == 1
+    assert len(access.detection_events) == 1
 
 
 # ---------------------------------------------------------------------------
-# Format-invalid surfacing (Req 4.5)
+# Format-invalid surfacing (Req 4.5, 7.5)
 # ---------------------------------------------------------------------------
 
 
@@ -516,7 +515,10 @@ def test_confidence_exactly_at_threshold_is_not_low_confidence():
 def test_format_invalid_surfaces_raw_and_reason():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=1)
     ocr = FakeOcr(OcrResult(text="123456", confidence=0.95))  # not Indonesian format
-    pipeline, *_ = make_pipeline(detector=FakeDetector([detection]), ocr=ocr)
+    access = FakeAccessController()
+    pipeline, *_ = make_pipeline(
+        detector=FakeDetector([detection]), ocr=ocr, access=access
+    )
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
 
@@ -526,15 +528,17 @@ def test_format_invalid_surfaces_raw_and_reason():
     # Surfaces the normalizer's specific, non-empty rejection reason (Req 4.5).
     assert event.manual_review_reason
     assert event.manual_review_reason == event.normalization_reason
+    # Format-invalid plates never reach the access controller (Req 7.4).
+    assert access.detection_events == []
 
 
 # ---------------------------------------------------------------------------
-# Routing valid detections (direction -> access control) + latency
+# Routing valid detections (flat match-and-log) + latency (Req 5.1)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_valid_inbound_is_routed_through_access_controller():
+def test_confident_valid_detection_is_routed_through_handle_detection():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.85, track_id=7)
     ocr = FakeOcr(OcrResult(text="B1234CD", confidence=0.95))
     access = FakeAccessController(
@@ -544,17 +548,17 @@ def test_valid_inbound_is_routed_through_access_controller():
             gate_requested=True,
         )
     )
-    pipeline, clock, *_ = make_pipeline(
+    pipeline, *_ = make_pipeline(
         detector=FakeDetector([detection]),
         ocr=ocr,
-        resolver=FakeDirectionResolver(DirectionOutcome.INBOUND),
         access=access,
     )
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
 
-    assert len(access.inbound_events) == 1
-    assert event.direction == DirectionOutcome.INBOUND
+    # Routed directly through the flat match-and-log, exactly once (Req 5.1).
+    assert len(access.detection_events) == 1
+    assert access.detection_events[0] is event
     assert event.normalized_plate == "B1234CD"
     assert event.detection_confidence == 0.85
     assert event.ocr_confidence == 0.95
@@ -582,31 +586,11 @@ def test_guest_decision_is_mirrored_to_manual_review_queue():
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
 
+    # Still routed through handle_detection, then mirrored onto the review queue.
+    assert len(access.detection_events) == 1
     assert event.classification == Classification.GUEST
     assert event.needs_manual_review is True
     assert list(pipeline.manual_review_queue) == [event]
-
-
-@pytest.mark.unit
-def test_direction_undetermined_surfaces_for_manual_resolution():
-    detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.85, track_id=7)
-    ocr = FakeOcr(OcrResult(text="B1234CD", confidence=0.95))
-    access = FakeAccessController()
-    pipeline, *_ = make_pipeline(
-        detector=FakeDetector([detection]),
-        ocr=ocr,
-        resolver=FakeDirectionResolver(DirectionOutcome.UNDETERMINED),
-        access=access,
-    )
-
-    [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
-
-    assert event.direction == DirectionOutcome.UNDETERMINED
-    assert event.needs_manual_review is True
-    assert event.manual_review_reason == REVIEW_DIRECTION_UNDETERMINED
-    # No direction-specific access rules applied (Req 7.4).
-    assert access.inbound_events == []
-    assert access.outbound_events == []
 
 
 @pytest.mark.unit
@@ -645,22 +629,3 @@ def test_on_manual_review_callback_is_invoked():
 
     [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
     assert seen == [event]
-
-
-@pytest.mark.unit
-def test_track_history_accumulates_centroids_across_frames():
-    detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=42)
-    ocr = FakeOcr(OcrResult(text="B1234CD", confidence=0.95))
-    pipeline, *_ = make_pipeline(
-        detector=FakeDetector([detection]),
-        ocr=ocr,
-        resolver=FakeDirectionResolver(DirectionOutcome.INBOUND),
-    )
-
-    pipeline.process_frame(a_frame(), acquired_at=0.0)
-    [event] = pipeline.process_frame(a_frame(), acquired_at=1.0)
-
-    # The same track id accumulated a centroid on each frame.
-    assert event.track is not None
-    assert event.track.track_id == 42
-    assert len(event.track.centroids) == 2

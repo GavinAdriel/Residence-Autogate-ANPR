@@ -122,43 +122,29 @@ class DirectionResolver(Protocol):
 
 @runtime_checkable
 class ResidentRepository(Protocol):
-    """CRUD access to the Resident_Database."""
+    """Read-only access to the resident whitelist.
+
+    The whitelist is managed externally (phpMyAdmin), so the port exposes only
+    the single read used by the access controller (Req 3.1, 3.2, 3.4).
+    """
 
     def find_by_plate(self, normalized_plate: str) -> Optional[ResidentRecord]:
         """Return the resident record for an exact normalized-plate match."""
         ...
 
-    def create(self, plate: str) -> ResidentRecord:
-        """Create and return a new resident record."""
-        ...
-
-    def update(self, id: str, plate: str) -> Optional[ResidentRecord]:
-        """Update an existing record; return None when it does not exist."""
-        ...
-
-    def delete(self, id: str) -> bool:
-        """Delete a record; return True when a record was deleted."""
-        ...
-
-    def list_all(self) -> list[ResidentRecord]:
-        """Return all resident records."""
-        ...
-
 
 @runtime_checkable
 class EventLogRepository(Protocol):
-    """Append-and-correlate access to the Event_Log."""
+    """Append-only access to the Event_Log.
+
+    Entry/exit correlation is retired in the monitoring migration (Req 5.2), so
+    the port exposes only the single write used by the access controller
+    (Req 4.7). Dropping ``find_open_entries``/``close_open_entry`` prevents the
+    retired flow from being reintroduced accidentally.
+    """
 
     def append(self, record: EventRecord) -> None:
-        """Write exactly one record atomically (exactly-once per attempt)."""
-        ...
-
-    def find_open_entries(self, normalized_plate: str) -> list[EventRecord]:
-        """Return Open_Entry_Records with an exact normalized-plate match."""
-        ...
-
-    def close_open_entry(self, entry_id: str, exit_id: str) -> None:
-        """Close an Open_Entry_Record, referencing the closing exit event."""
+        """Write exactly one record (exactly-once per detection)."""
         ...
 
 

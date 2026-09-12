@@ -22,6 +22,16 @@ mysql-connector-python
 # Streamlit
 streamlit==1.28.0
 protobuf==3.20.2
+# Pure-Python MySQL client driver for the Docker-hosted MySQL 8.0 backend
+# (replaces the previous SQLite persistence layer). Pinned exactly.
+# Shared by the anpr persistence layer and the FastAPI service below.
+PyMySQL==1.1.1
+# Required by PyMySQL to complete MySQL 8.0's default caching_sha2_password
+# handshake. Without it, connecting raises "'cryptography' package is required
+# for sha256_password or caching_sha2_password auth methods" whenever the
+# server's in-memory auth cache is cold (e.g. after a MySQL restart), so it is
+# a hard runtime dependency, not an optional extra.
+cryptography==43.0.3
 
 # --- Test ---
 pytest==8.3.3
@@ -32,6 +42,8 @@ hypothesis==6.112.1
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.35
-pymysql==1.1.1
 python-dotenv==1.0.1
-cryptography==43.0.1
+# PyMySQL and cryptography are pinned once in the Runtime section above; the API
+# shares those pins. Listing them twice with different versions makes the pinned
+# version depend on file order, so the duplicates were folded into the single
+# runtime entries.

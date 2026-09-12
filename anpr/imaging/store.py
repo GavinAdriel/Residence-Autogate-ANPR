@@ -253,9 +253,9 @@ class DiskImageStore:
         """
         cutoff = _as_aware(now) - timedelta(days=self._retention_days)
 
-        rows = self._db.connection.execute(
+        rows = self._db.query(
             "SELECT event_id, snapshot_path, thumbnail_path, captured_at FROM images"
-        ).fetchall()
+        )
 
         expired_ids: list[str] = []
         for row in rows:
@@ -276,10 +276,13 @@ class DiskImageStore:
         if not expired_ids:
             return 0
 
-        with self._db.connection as conn:
-            conn.executemany(
-                "DELETE FROM images WHERE event_id = ?",
-                [(event_id,) for event_id in expired_ids],
+        # The shared guarded API has no batch primitive, so each deletion runs
+        # as its own guarded write (each acquires DB_Access_Lock and pings per
+        # Req 8.1, 8.6). Behaviour matches the prior executemany batch.
+        for event_id in expired_ids:
+            self._db.execute(
+                "DELETE FROM images WHERE event_id = %s",
+                (event_id,),
             )
         return len(expired_ids)
 
@@ -352,14 +355,23 @@ class DiskImageStore:
         return buffer.tobytes()
 
     def _insert_reference(self, ref: ImageRef) -> None:
-        """Insert (or replace) the on-disk image reference row (Req 11.3)."""
-        with self._db.connection as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO images "
-                "(event_id, snapshot_path, thumbnail_path, captured_at) "
-                "VALUES (?, ?, ?, ?)",
-                (ref.event_id, ref.snapshot_path, ref.thumbnail_path, ref.captured_at),
-            )
+        """Insert (or replace) the on-disk image reference row (Req 11.3).
+
+        Uses the guarded ``Database`` write API with ``%s`` placeholders and a
+        MySQL upsert (``ON DUPLICATE KEY UPDATE``) so a re-captured event_id
+        overwrites its reference, matching the prior sqlite ``INSERT OR REPLACE``
+        behaviour (Req 1.2, 1.3, 8.1, 8.6).
+        """
+        self._db.execute(
+            "INSERT INTO images "
+            "(event_id, snapshot_path, thumbnail_path, captured_at) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "snapshot_path=VALUES(snapshot_path), "
+            "thumbnail_path=VALUES(thumbnail_path), "
+            "captured_at=VALUES(captured_at)",
+            (ref.event_id, ref.snapshot_path, ref.thumbnail_path, ref.captured_at),
+        )
 
 
 # ----------------------------------------------------------------------

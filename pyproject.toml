@@ -23,6 +23,15 @@ dependencies = [
     "opencv-python==4.10.0.84",
     "PyQt5==5.15.11",
     "PyYAML==6.0.2",
+    # Pure-Python MySQL client driver for the Docker-hosted MySQL 8.0 backend
+    # (replaces the previous SQLite persistence layer). Pinned exactly.
+    "PyMySQL==1.1.1",
+    # Required by PyMySQL to complete MySQL 8.0's default caching_sha2_password
+    # handshake. Without it, connecting raises "'cryptography' package is
+    # required for sha256_password or caching_sha2_password auth methods"
+    # whenever the server's in-memory auth cache is cold (e.g. after a MySQL
+    # restart), so it is a hard runtime dependency, not an optional extra.
+    "cryptography==43.0.3",
 ]
 
 [project.optional-dependencies]

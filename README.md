@@ -130,6 +130,53 @@ ANPR_GATE__MODE=hardware
 pytest
 ```
 
+## Manual Verification (MySQL)
+
+The automated test suite runs entirely against a fake database, so it never touches a
+live MySQL server. Use these ordered steps to verify real MySQL behavior end-to-end with
+the Docker-hosted database and phpMyAdmin.
+
+1. **Start MySQL 8.0 + phpMyAdmin:**
+   ```bash
+   docker compose up -d
+   ```
+   On first startup (empty data directory), the schema is created automatically from
+   `docker/mysql/init/01-schema.sql` — the `residents`, `event_log`, and `images` tables.
+   The application never creates or alters schema; it expects these tables to already
+   exist.
+
+2. **Seed a resident row in phpMyAdmin:**
+   - Open phpMyAdmin at [http://localhost:8080](http://localhost:8080) and log in with
+     user `anpr` / password `anprpassword` (or root `rootpassword`).
+   - Select the `anpr` database and open the `residents` table.
+   - Insert one row, setting `normalized_plate` to a plate you can present to the camera
+     (in normalized Indonesian format, e.g. `B1234ABC`). Provide unique `id`, `created_at`,
+     and `updated_at` values.
+
+3. **Run the app against the seeded database:**
+   ```bash
+   anpr
+   ```
+   The default config connects to MySQL at `127.0.0.1:3306`, database `anpr`, user `anpr`,
+   password `anprpassword`. Override the password without editing config via
+   `ANPR_DATABASE__PASSWORD`. Startup refuses to continue if the database is unreachable or
+   any required table is missing.
+
+4. **Confirm the resulting `event_log` rows in phpMyAdmin:**
+   Present plates to the camera and inspect the `event_log` table. For every handled
+   detection the app appends exactly one flat row:
+
+   | Detection | `classification` | `grant_method` | `direction` | `event_kind` | `entry_state` |
+   |-----------|------------------|----------------|-------------|--------------|---------------|
+   | Resident (gate opens) | `RESIDENT` | `AUTOMATIC` | NULL | NULL | `N/A` |
+   | Guest (no match) | `GUEST` | `NONE` | NULL | NULL | `N/A` |
+
+   In both cases `direction` and `event_kind` are `NULL` and `entry_state` is the `N/A`
+   sentinel, confirming the direction-free match-and-log flow.
+
+Stop the database with `docker compose down` (data persists in the named volume) or
+`docker compose down -v` to delete all data.
+
 ## Project Structure
 
 ```

@@ -4,7 +4,7 @@
 environment variables so that, where a setting is defined in both, the
 environment-variable value wins (Requirement 14.1). The resolved configuration
 supplies every environment-specific setting (camera source, model weights,
-storage/database locations, network addresses, gate mode, direction mode, ...)
+storage location, MySQL connection settings, network addresses, gate mode, ...)
 so switching between the local-test and field deployments is config-only with
 no code changes (Requirement 14.2).
 
@@ -219,17 +219,6 @@ class ConfigProvider:
             lambda v: _is_num(v) and 1 <= v <= 30,
             "must be between 1 and 30",
         )
-        # direction
-        check(
-            "direction.mode",
-            lambda v: v in {"single_camera_trajectory", "dual_camera"},
-            "must be one of {single_camera_trajectory, dual_camera}",
-        )
-        check(
-            "direction.confidence_threshold",
-            lambda v: _is_num(v) and 0 <= v <= 1,
-            "must be between 0 and 1",
-        )
         # storage
         check(
             "storage.image_dir",
@@ -247,11 +236,33 @@ class ConfigProvider:
             lambda v: _is_num(v) and 0 < v <= 24,
             "must be between 1 and 24",
         )
-        # database
+        # database (MySQL connection settings, Requirements 2.1-2.4). The env
+        # overlay coerces ANPR_DATABASE__PORT / ANPR_DATABASE__PASSWORD toward
+        # the file value's type via ``_coerce`` before validation runs here.
         check(
-            "database.location",
+            "database.host",
             lambda v: isinstance(v, str) and v.strip() != "",
-            "must be a non-empty path",
+            "must be a non-empty string",
+        )
+        check(
+            "database.port",
+            lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535,
+            "must be an integer between 1 and 65535",
+        )
+        check(
+            "database.name",
+            lambda v: isinstance(v, str) and v.strip() != "",
+            "must be a non-empty string",
+        )
+        check(
+            "database.user",
+            lambda v: isinstance(v, str) and v.strip() != "",
+            "must be a non-empty string",
+        )
+        check(
+            "database.password",
+            lambda v: isinstance(v, str),
+            "must be a string",
         )
         return errors
 
