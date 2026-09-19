@@ -1,6 +1,6 @@
 """MySQL-backed implementation of the ``EventLogRepository`` interface.
 
-``MySqlEventLogRepository`` provides append-only access to the ``event_log``
+``MySqlEventLogRepository`` provides append-only access to the ``ANPR_Log``
 table. It exposes exactly one operation - ``append`` - and no
 ``find_open_entries``/``close_open_entry`` reads: entry/exit correlation is
 retired in the monitoring migration (Req 5.2), so ``handle_detection`` writes
@@ -28,22 +28,29 @@ in ``anpr.core.interfaces``.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from anpr.core.models import EventRecord
 from anpr.persistence.db import Database
 
-# Columns inserted for every record, in ``EventRecord`` field order.
+# Columns inserted for every record, in ``ANPR_Log`` schema naming.
+#
+# ``Log_ID`` is deliberately absent: it is AUTO_INCREMENT and assigned by MySQL,
+# so the application no longer supplies its own event id. ``append`` returns the
+# generated value and stamps it onto the record.
 _COLUMNS = (
-    "id, timestamp, ocr_plate, guard_plate, normalized_plate, classification, "
-    "direction, grant_method, event_kind, entry_state, closed_by_event_id, "
-    "image_ref, detection_confidence, ocr_confidence, processing_latency_ms, "
-    "environment_label"
+    "Inserted_Time, Camera_ID, License_Plate_Number, Normalized_Plate, "
+    "Guard_Plate, Vehicle_ID, Classification, Direction, Event_Kind, "
+    "Grant_Method, Entry_State, Detection_Confidence, OCR_Confidence, "
+    "Processing_Time_MS, Environment_Label, Image_Ref, Closed_By_Log_ID"
 )
+
+_PLACEHOLDERS = ", ".join(["%s"] * len(_COLUMNS.split(",")))
 
 
 class MySqlEventLogRepository:
-    """Append-only access to the ``event_log`` table backed by MySQL.
+    """Append-only access to the ``ANPR_Log`` table backed by MySQL.
 
     Parameters
     ----------
@@ -59,38 +66,46 @@ class MySqlEventLogRepository:
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
-    def append(self, record: EventRecord) -> None:
-        """Write exactly one ``EventRecord`` (Req 4.7).
+    def append(self, record: EventRecord) -> int:
+        """Write exactly one ``EventRecord`` and return its ``Log_ID`` (Req 4.7).
 
         The insert uses the full column list with PyMySQL ``%s`` placeholders
-        (Req 1.2) and goes through the guarded :meth:`Database.execute`, which
-        acquires the access lock, pings with reconnect, executes, commits, and
-        releases the lock on every path including error (Req 8.1-8.7). In the
-        flat match-and-log flow ``direction``/``event_kind`` are written as
-        ``NULL`` and ``entry_state`` as the ``"N/A"`` sentinel (Req 5.3, 5.4).
+        (Req 1.2) and goes through the guarded
+        :meth:`Database.execute_returning_id`, which acquires the access lock,
+        pings with reconnect, executes, reads ``lastrowid`` inside the lock,
+        commits, and releases the lock on every path including error
+        (Req 8.1-8.7). In the flat match-and-log flow ``Direction``/``Event_Kind``
+        are written as ``NULL`` and ``Entry_State`` as the ``"N/A"`` sentinel
+        (Req 5.3, 5.4).
+
+        The generated ``Log_ID`` is both returned and stamped onto
+        ``record.log_id`` so the caller can attach the ``Images`` row, whose
+        ``Log_ID`` FK is NOT NULL.
         """
-        self._db.execute(
-            f"INSERT INTO event_log ({_COLUMNS}) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        log_id = self._db.execute_returning_id(
+            f"INSERT INTO ANPR_Log ({_COLUMNS}) VALUES ({_PLACEHOLDERS})",
             (
-                record.id,
-                record.timestamp,
+                _datetime_value(record.timestamp),
+                record.camera_id,
                 record.ocr_plate,
-                record.guard_plate,
                 record.normalized_plate,
+                record.guard_plate,
+                record.vehicle_id,
                 _enum_value(record.classification),
                 _enum_value(record.direction),
-                _enum_value(record.grant_method),
                 _enum_value(record.event_kind),
+                _enum_value(record.grant_method),
                 _enum_value(record.entry_state),
-                record.closed_by_event_id,
-                record.image_ref,
                 _metric_value(record.detection_confidence),
                 _metric_value(record.ocr_confidence),
                 _metric_value(record.processing_latency_ms),
                 _enum_value(record.environment_label),
+                record.image_ref,
+                _int_or_none(record.closed_by_event_id),
             ),
         )
+        record.log_id = log_id
+        return log_id
 
 
 # ----------------------------------------------------------------------
@@ -101,11 +116,66 @@ def _enum_value(member) -> Optional[str]:
     return member.value if member is not None else None
 
 
-def _metric_value(value: "float | int | str") -> "float | int | str":
-    """Persist a numeric metric as-is, or the literal ``"N/A"`` sentinel.
+def _metric_value(value: "float | int | str | None") -> "float | int | None":
+    """Bind a numeric metric, mapping an absent value to SQL ``NULL``.
 
-    The value is stored unchanged: a float/int is bound directly and the
-    ``NA_SENTINEL`` string is stored verbatim so it round-trips as ``"N/A"``
-    (Req 15.5, 16.4).
+    The ``ANPR_Log`` metric columns are ``DECIMAL`` (``Detection_Confidence`` and
+    ``OCR_Confidence`` are ``DECIMAL(5,4)``, ``Processing_Time_MS`` is
+    ``DECIMAL(10,2)``), so the domain's ``NA_SENTINEL`` string cannot be stored
+    there: under MySQL's default ``STRICT_TRANS_TABLES`` binding ``"N/A"`` to a
+    DECIMAL column raises error 1366 and the whole insert fails, which would drop
+    any event with a missing metric (an OCR timeout, for instance).
+
+    All three columns are nullable, so an absent metric becomes ``NULL``. Absence
+    is still represented explicitly rather than omitted (Req 15.5, 16.4); the
+    representation is simply SQL ``NULL`` instead of the ``"N/A"`` string, and
+    readers render ``NULL`` back as "N/A" for display.
+
+    Any non-numeric string is treated as absent, so an unexpected sentinel can
+    never turn a single event into a failed insert.
     """
+    if value is None or isinstance(value, str):
+        return None
+    if isinstance(value, bool):  # bool is an int subclass; not a real metric
+        return None
     return value
+
+
+def _datetime_value(value: "str | datetime | None") -> Optional[datetime]:
+    """Coerce a record timestamp to a naive UTC ``datetime`` for ``DATETIME``.
+
+    ``EventRecord.timestamp`` is ISO-8601 *with a UTC offset* by design
+    (Req 10.3), but ``ANPR_Log.Inserted_Time`` is a plain MySQL ``DATETIME``,
+    which has no timezone component and rejects the trailing offset. The value is
+    therefore converted to UTC and made naive before binding.
+
+    ``None`` is returned when the timestamp is missing or unparseable, letting the
+    column's ``DEFAULT CURRENT_TIMESTAMP`` supply the time rather than failing the
+    insert.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _int_or_none(value) -> Optional[int]:
+    """Coerce a value to ``int``, or ``None`` when absent/non-numeric.
+
+    ``Closed_By_Log_ID`` is an ``INT`` FK, whereas the retired correlation flow
+    carried a string event id. It is always ``None`` in the flat flow (Req 5.2).
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

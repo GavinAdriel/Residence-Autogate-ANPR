@@ -44,6 +44,7 @@ from typing import Callable, Optional
 from anpr.core.interfaces import (
     EventLogRepository,
     GateController,
+    ImageStore,
     ResidentRepository,
 )
 from anpr.core.models import (
@@ -55,6 +56,7 @@ from anpr.core.models import (
     EnvironmentLabel,
     EventRecord,
     GrantMethod,
+    ResidentRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,16 @@ class AccessController:
     environment_label:
         Deployment environment stamped onto every written record; optional so
         pure-logic tests need not supply one.
+    camera_id:
+        Identifier of the camera that produced the detection, written to
+        ``ANPR_Log.Camera_ID``. That column is NOT NULL with a foreign key to
+        ``Camera``, so a real deployment must supply an id matching a seeded
+        ``Camera`` row or the insert is rejected. Optional here so pure-logic
+        tests, which use a fake repository, need not supply one.
+    image_store:
+        Optional store used to link a captured image to the logged event once its
+        ``Log_ID`` is known (``Images.Log_ID`` is a NOT NULL foreign key, so the
+        link can only be made after the log write).
     clock:
         Timezone-aware time source; injectable for deterministic tests.
     id_factory:
@@ -102,6 +114,8 @@ class AccessController:
         gate_controller: GateController,
         *,
         environment_label: Optional[EnvironmentLabel] = None,
+        camera_id: Optional[int] = None,
+        image_store: Optional["ImageStore"] = None,
         clock: Callable[[], datetime] = _default_clock,
         id_factory: Callable[[], str] = _default_id_factory,
     ) -> None:
@@ -109,6 +123,8 @@ class AccessController:
         self._event_log_repo = event_log_repo
         self._gate_controller = gate_controller
         self._environment_label = environment_label
+        self._camera_id = camera_id
+        self._image_store = image_store
         self._clock = clock
         self._id_factory = id_factory
 
@@ -144,8 +160,9 @@ class AccessController:
             decision.reason = (
                 "Resident lookup failed; surfaced for manual decision."
             )
-            # Exactly one flat record for the detection (Req 4.7).
-            self._append_flat_record(ev, normalized_plate, decision)
+            # Exactly one flat record for the detection (Req 4.7). No resident is
+            # known, so Vehicle_ID is written as NULL.
+            self._append_flat_record(ev, normalized_plate, decision, None)
             return decision
 
         if resident is not None:
@@ -173,8 +190,9 @@ class AccessController:
             decision.surfaced_to_guard = True
             decision.reason = "No resident match; surfaced for manual decision."
 
-        # Exactly one flat record for the detection (Req 4.7).
-        self._append_flat_record(ev, normalized_plate, decision)
+        # Exactly one flat record for the detection (Req 4.7). ``resident`` is the
+        # matched whitelist row (or None for a guest), supplying Vehicle_ID.
+        self._append_flat_record(ev, normalized_plate, decision, resident)
         return decision
 
     # ------------------------------------------------------------------
@@ -185,12 +203,19 @@ class AccessController:
         ev: DetectionEvent,
         normalized_plate: str,
         decision: AccessDecision,
+        resident: Optional[ResidentRecord],
     ) -> None:
         """Build and append exactly one flat record (Req 4.7, 5.2, 5.3, 5.4).
 
         The record carries ``direction=None``, ``event_kind=None``,
         ``entry_state=EntryState.NA`` ("N/A"), and ``closed_by_event_id=None``:
         entry/exit correlation is retired in the monitoring migration.
+
+        ``camera_id`` is stamped from configuration (``ANPR_Log.Camera_ID`` is NOT
+        NULL) and ``vehicle_id`` from the matched whitelist row, or left NULL for a
+        guest or a failed lookup. After the write the generated ``Log_ID`` is used
+        to link any captured image, which cannot happen earlier because
+        ``Images.Log_ID`` is a NOT NULL foreign key.
         """
         record = EventRecord(
             id=self._event_id(ev),
@@ -209,9 +234,31 @@ class AccessController:
             ocr_confidence=_metric(ev.ocr_confidence),
             processing_latency_ms=_metric(ev.processing_latency_ms),
             environment_label=self._environment_label,
+            camera_id=self._camera_id,
+            vehicle_id=(resident.vehicle_id if resident is not None else None),
         )
         self._event_log_repo.append(record)
         decision.event_record = record
+        self._link_image(ev, record)
+
+    def _link_image(self, ev: DetectionEvent, record: EventRecord) -> None:
+        """Attach a captured image to the logged event via its ``Log_ID``.
+
+        A missing store, missing capture, or missing ``Log_ID`` is simply a no-op.
+        Failures never propagate: the event is already logged and the gate
+        decision already made, so a bookkeeping fault must not surface as an
+        access-control error (Req 11.7).
+        """
+        if self._image_store is None or ev.image_ref is None:
+            return
+        if record.log_id is None:
+            return
+        try:
+            self._image_store.record_reference(ev.image_ref, record.log_id)
+        except Exception as exc:  # noqa: BLE001 - image linkage is non-critical
+            logger.error(
+                "Failed to link image for log %s: %s", record.log_id, exc
+            )
 
     def _event_id(self, ev: DetectionEvent) -> str:
         """Return the event's id, generating a fresh one when absent."""

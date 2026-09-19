@@ -3,15 +3,20 @@
 These example-based tests exercise the image store's database interactions
 through the shared fake DB-API stub (``tests/persistence/fake_dbapi.py``) so they
 run with **no live MySQL** (Req 10.1, 10.3). They pin the SQL contract that the
-store now rides on top of the guarded MySQL :class:`~anpr.persistence.db.Database`
-API (task 7.1):
+store rides on top of the guarded MySQL :class:`~anpr.persistence.db.Database`
+API, as retargeted onto the ``anpr_system`` schema:
 
-* The image-reference insert uses ``%s`` placeholders and the MySQL upsert
-  ``ON DUPLICATE KEY UPDATE`` (Req 1.2, 8.1) - it never issues the SQLite
-  ``INSERT OR REPLACE`` or ``?`` placeholder.
-* Retention reads via the guarded ``query`` (a ``SELECT ... FROM images``) and
-  deletes via the guarded ``execute`` (repeated ``DELETE ... WHERE event_id = %s``)
-  (Req 1.2, 8.1).
+* ``record_reference`` inserts into ``Images`` with ``%s`` placeholders (Req 1.2,
+  8.1), binding the parent ``Log_ID``. It is a **plain INSERT**: the previous
+  ``ON DUPLICATE KEY UPDATE`` upsert is gone because ``Images.Log_ID`` carries no
+  unique constraint in this schema, so an upsert clause could never fire and
+  would silently accumulate duplicates.
+* ``Captured_At`` is bound as a *naive UTC* ``datetime``, because the column is a
+  MySQL ``DATETIME`` which rejects the offset-bearing ISO-8601 string the domain
+  carries.
+* Retention reads via the guarded ``query`` (a ``SELECT ... FROM Images``) and
+  deletes via the guarded ``execute`` (repeated
+  ``DELETE ... WHERE Image_ID = %s``) (Req 1.2, 8.1).
 * No DDL (CREATE/ALTER/DROP/TRUNCATE) is ever issued (Req 1.3).
 """
 
@@ -44,11 +49,11 @@ def _assert_no_sqlite_placeholders(executed_sql: list[str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# _insert_reference: %s placeholders + ON DUPLICATE KEY UPDATE upsert
+# record_reference: %s placeholders, plain INSERT, Log_ID linkage
 # ----------------------------------------------------------------------
 @pytest.mark.unit
-def test_insert_reference_uses_placeholders_and_upsert(tmp_path) -> None:
-    """The image-reference insert is a parameterized MySQL upsert (Req 1.2, 8.1)."""
+def test_record_reference_uses_placeholders_and_binds_log_id(tmp_path) -> None:
+    """The image-reference insert is a parameterized ``Images`` INSERT (Req 1.2, 8.1)."""
     db, conn = fake_database()
     conn.queue_result(rowcount=1)  # the guarded write
 
@@ -60,7 +65,7 @@ def test_insert_reference_uses_placeholders_and_upsert(tmp_path) -> None:
         captured_at="2024-01-01T08:30:00+07:00",
     )
 
-    store._insert_reference(ref)
+    assert store.record_reference(ref, 42) is True
 
     # Exactly one guarded write, routed through Database.execute (which commits).
     assert len(conn.executed) == 1
@@ -68,36 +73,63 @@ def test_insert_reference_uses_placeholders_and_upsert(tmp_path) -> None:
 
     sql = conn.executed[0].sql
     assert sql.lstrip().upper().startswith("INSERT INTO IMAGES")
-    # MySQL upsert semantics replace the prior sqlite INSERT OR REPLACE (Req 1.2).
-    assert "ON DUPLICATE KEY UPDATE" in sql.upper()
+    # Plain INSERT: Images.Log_ID has no unique constraint, so an upsert clause
+    # would never fire and would accumulate duplicate rows instead.
+    assert "ON DUPLICATE KEY UPDATE" not in sql.upper()
     assert "INSERT OR REPLACE" not in sql.upper()
     # One %s per inserted column and no SQLite '?' placeholder (Req 1.2).
     assert sql.count("%s") == 4
     assert "?" not in sql
 
-    # Params are bound positionally in ImageRef field order.
+    # The parent Log_ID is bound first, and Captured_At is converted from the
+    # offset-bearing domain string to a naive UTC datetime for the DATETIME
+    # column: 08:30+07:00 is 01:30 UTC.
     assert conn.executed[0].params == (
-        "evt-1",
+        42,
         str(tmp_path / "evt-1.jpg"),
         str(tmp_path / "evt-1_thumb.jpg"),
-        "2024-01-01T08:30:00+07:00",
+        datetime(2024, 1, 1, 1, 30, 0),
     )
 
 
 @pytest.mark.unit
-def test_insert_reference_issues_no_ddl(tmp_path) -> None:
+def test_record_reference_returns_false_on_database_fault(tmp_path) -> None:
+    """A DB fault is reported as ``False``, never raised (Req 11.3, 11.8).
+
+    The event is already logged by the time the reference is recorded, so a
+    failure here must not propagate into the caller.
+    """
+    import pymysql
+
+    db, conn = fake_database()
+    conn.queue_error(pymysql.err.OperationalError(1146, "Table 'Images' missing"))
+
+    store = DiskImageStore(db=db, image_dir=str(tmp_path))
+    ref = ImageRef(
+        event_id="evt-1",
+        snapshot_path=str(tmp_path / "evt-1.jpg"),
+        thumbnail_path=str(tmp_path / "evt-1_thumb.jpg"),
+        captured_at="2024-01-01T08:30:00+07:00",
+    )
+
+    assert store.record_reference(ref, 42) is False
+
+
+@pytest.mark.unit
+def test_record_reference_issues_no_ddl(tmp_path) -> None:
     """The insert path never issues DDL (Req 1.3)."""
     db, conn = fake_database()
     conn.queue_result(rowcount=1)
 
     store = DiskImageStore(db=db, image_dir=str(tmp_path))
-    store._insert_reference(
+    store.record_reference(
         ImageRef(
             event_id="evt-1",
             snapshot_path=str(tmp_path / "evt-1.jpg"),
             thumbnail_path=str(tmp_path / "evt-1_thumb.jpg"),
             captured_at="2024-01-01T08:30:00+07:00",
-        )
+        ),
+        7,
     )
 
     _assert_no_ddl(conn.executed_sql)
@@ -107,12 +139,12 @@ def test_insert_reference_issues_no_ddl(tmp_path) -> None:
 # ----------------------------------------------------------------------
 # run_retention: SELECT via query, DELETE via execute, %s placeholders
 # ----------------------------------------------------------------------
-def _row(event_id: str, captured_at: datetime) -> dict:
-    """A canned ``images`` retention row with an ISO-8601 capture time."""
+def _row(image_id: int, captured_at: datetime) -> dict:
+    """A canned ``Images`` retention row, keyed by the query's column aliases."""
     return {
-        "event_id": event_id,
-        "snapshot_path": f"/tmp/{event_id}.jpg",
-        "thumbnail_path": f"/tmp/{event_id}_thumb.jpg",
+        "image_id": image_id,
+        "snapshot_path": f"/tmp/img-{image_id}.jpg",
+        "thumbnail_path": f"/tmp/img-{image_id}_thumb.jpg",
         "captured_at": captured_at.isoformat(),
     }
 
@@ -124,8 +156,8 @@ def test_run_retention_selects_then_deletes_expired_via_guarded_api(tmp_path) ->
 
     now = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
     # One row well past the 30-day window (expired) and one within it (kept).
-    expired = _row("evt-old", now - timedelta(days=100))
-    fresh = _row("evt-new", now - timedelta(days=1))
+    expired = _row(11, now - timedelta(days=100))
+    fresh = _row(22, now - timedelta(days=1))
     conn.queue_rows(expired, fresh)  # served to the retention SELECT
     conn.queue_result(rowcount=1)  # served to the single DELETE
 
@@ -137,12 +169,12 @@ def test_run_retention_selects_then_deletes_expired_via_guarded_api(tmp_path) ->
     # First statement is the read-only SELECT issued via Database.query.
     select_sql = conn.executed[0].sql
     assert select_sql.lstrip().upper().startswith("SELECT")
-    assert "FROM images" in select_sql
+    assert "FROM Images" in select_sql
 
     # The second statement is the parameterized DELETE issued via Database.execute.
     delete_stmt = conn.executed[1]
-    assert delete_stmt.sql.strip() == "DELETE FROM images WHERE event_id = %s"
-    assert delete_stmt.params == ("evt-old",)
+    assert delete_stmt.sql.strip() == "DELETE FROM Images WHERE Image_ID = %s"
+    assert delete_stmt.params == (11,)
 
     # Only the DELETE goes through the write path, so exactly one commit ran;
     # the SELECT (query) does not commit.
@@ -151,12 +183,32 @@ def test_run_retention_selects_then_deletes_expired_via_guarded_api(tmp_path) ->
 
 
 @pytest.mark.unit
+def test_run_retention_accepts_datetime_capture_times(tmp_path) -> None:
+    """A ``DATETIME`` column yields ``datetime`` objects, which retention accepts.
+
+    PyMySQL returns a real ``datetime`` for ``Captured_At`` rather than a string,
+    so retention must not depend on ISO-string parsing.
+    """
+    db, conn = fake_database()
+
+    now = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    row = _row(11, now - timedelta(days=100))
+    row["captured_at"] = (now - timedelta(days=100)).replace(tzinfo=None)
+    conn.queue_rows(row)
+    conn.queue_result(rowcount=1)
+
+    store = DiskImageStore(db=db, image_dir=str(tmp_path), retention_days=30)
+
+    assert store.run_retention(now) == 1
+
+
+@pytest.mark.unit
 def test_run_retention_deletes_each_expired_row_individually(tmp_path) -> None:
     """Each expired row is deleted by its own guarded ``execute`` (Req 8.1)."""
     db, conn = fake_database()
 
     now = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    old_rows = [_row(f"evt-{i}", now - timedelta(days=100 + i)) for i in range(3)]
+    old_rows = [_row(i, now - timedelta(days=100 + i)) for i in range(3)]
     conn.queue_rows(*old_rows)
     for _ in old_rows:
         conn.queue_result(rowcount=1)  # one canned result per DELETE
@@ -167,9 +219,9 @@ def test_run_retention_deletes_each_expired_row_individually(tmp_path) -> None:
     assert deleted == 3
     delete_stmts = [s for s in conn.executed if s.sql.strip().upper().startswith("DELETE")]
     assert len(delete_stmts) == 3
-    assert [s.params for s in delete_stmts] == [("evt-0",), ("evt-1",), ("evt-2",)]
+    assert [s.params for s in delete_stmts] == [(0,), (1,), (2,)]
     for stmt in delete_stmts:
-        assert stmt.sql.strip() == "DELETE FROM images WHERE event_id = %s"
+        assert stmt.sql.strip() == "DELETE FROM Images WHERE Image_ID = %s"
     # One commit per DELETE (three guarded writes).
     assert conn.commits == 3
 
@@ -180,7 +232,7 @@ def test_run_retention_no_expired_rows_issues_no_delete(tmp_path) -> None:
     db, conn = fake_database()
 
     now = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    conn.queue_rows(_row("evt-new", now - timedelta(days=1)))
+    conn.queue_rows(_row(22, now - timedelta(days=1)))
 
     store = DiskImageStore(db=db, image_dir=str(tmp_path), retention_days=30)
     deleted = store.run_retention(now)
@@ -197,7 +249,7 @@ def test_run_retention_issues_no_ddl(tmp_path) -> None:
     db, conn = fake_database()
 
     now = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    conn.queue_rows(_row("evt-old", now - timedelta(days=100)))
+    conn.queue_rows(_row(11, now - timedelta(days=100)))
     conn.queue_result(rowcount=1)
 
     store = DiskImageStore(db=db, image_dir=str(tmp_path), retention_days=30)

@@ -71,6 +71,7 @@ from anpr.core.models import (
     EventKind,
     EventRecord,
     GrantMethod,
+    ImageRef,
 )
 from anpr.core.normalizer import PlateNormalizer
 
@@ -304,6 +305,7 @@ class ManualGrantService:
         *,
         image_store: Optional[ImageStore] = None,
         environment_label: Optional[EnvironmentLabel] = None,
+        camera_id: Optional[int] = None,
         id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
         clock_iso: Callable[[], str] = _now_iso,
     ) -> None:
@@ -312,6 +314,9 @@ class ManualGrantService:
         self._normalizer = normalizer
         self._image_store = image_store
         self._environment_label = environment_label
+        # ANPR_Log.Camera_ID is NOT NULL with an FK to Camera, so a manual-grant
+        # record must carry a camera id just like an automatic detection does.
+        self._camera_id = camera_id
         self._id_factory = id_factory
         self._clock_iso = clock_iso
 
@@ -353,7 +358,10 @@ class ManualGrantService:
         if provided:
             normalized_plate = self._normalizer.normalize(str(plate)).normalized
 
-        image_ref = self._maybe_capture(frame, eid)
+        # The files are written now so the snapshot path can go into
+        # ANPR_Log.Image_Ref; the Images row is inserted after the log write,
+        # once a Log_ID exists for its NOT NULL foreign key.
+        captured = self._maybe_capture(frame, eid)
 
         record = EventRecord(
             id=eid,
@@ -366,7 +374,8 @@ class ManualGrantService:
             grant_method=GrantMethod.MANUAL,
             event_kind=EventKind.MANUAL,
             entry_state=EntryState.NA,
-            image_ref=image_ref,
+            image_ref=(captured.snapshot_path if captured is not None else None),
+            camera_id=self._camera_id,
             detection_confidence=NA_SENTINEL,
             ocr_confidence=NA_SENTINEL,
             processing_latency_ms=NA_SENTINEL,
@@ -387,6 +396,9 @@ class ManualGrantService:
                 record=record,
             )
 
+        # Link the capture to the freshly written log row (Images.Log_ID FK).
+        self._maybe_link_image(captured, record)
+
         return ManualGrantResult(
             gate_success=True,
             recorded=True,
@@ -394,20 +406,43 @@ class ManualGrantService:
             record=record,
         )
 
-    def _maybe_capture(self, frame: Optional[Frame], event_id: str) -> Optional[str]:
-        """Capture and store an image for the grant when a store/frame exist.
+    def _maybe_capture(
+        self, frame: Optional[Frame], event_id: str
+    ) -> Optional[ImageRef]:
+        """Write an image for the grant to disk when a store/frame exist.
 
-        A capture failure never blocks the grant: the record is kept without an
-        image reference (Req 11.7).
+        Returns the reference so the caller can both put the snapshot path on the
+        record and, after the log write, insert the ``Images`` row. A capture
+        failure never blocks the grant: the record is kept without an image
+        reference (Req 11.7).
         """
         if frame is None or self._image_store is None:
             return None
         try:
-            ref = self._image_store.capture_and_store(frame, event_id)
+            return self._image_store.capture_and_store(frame, event_id)
         except Exception as exc:  # noqa: BLE001 - capture must not crash the UI
             logger.error("Manual-grant image capture failed for event %s: %s", event_id, exc)
             return None
-        return ref.snapshot_path if ref is not None else None
+
+    def _maybe_link_image(
+        self, captured: Optional[ImageRef], record: EventRecord
+    ) -> None:
+        """Insert the ``Images`` row for a capture once ``Log_ID`` is known.
+
+        Never raises: the gate has already opened and the grant is already
+        recorded, so a failure to record the image reference must not turn a
+        successful grant into an error (Req 11.7).
+        """
+        if captured is None or self._image_store is None or record.log_id is None:
+            return
+        try:
+            self._image_store.record_reference(captured, record.log_id)
+        except Exception as exc:  # noqa: BLE001 - linkage must not crash the UI
+            logger.error(
+                "Manual-grant image linkage failed for log %s: %s",
+                record.log_id,
+                exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +489,7 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         image_store: Optional[ImageStore] = None,
         frame_provider: Optional[Callable[[], Optional[tuple[Frame, list]]]] = None,
         environment_label: Optional[EnvironmentLabel] = None,
+        camera_id: Optional[int] = None,
         parent: Optional[Any] = None,
     ) -> None:
         if not _PYQT5_AVAILABLE:  # pragma: no cover - exercised only pre-install
@@ -474,6 +510,7 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
             normalizer,
             image_store=image_store,
             environment_label=environment_label,
+            camera_id=camera_id,
         )
 
         # Most recent frame/detections, reused when capturing a manual-grant

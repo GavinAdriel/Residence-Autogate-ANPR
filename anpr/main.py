@@ -148,6 +148,29 @@ def resolve_environment_label(config: ConfigProvider) -> Optional[EnvironmentLab
         return None
 
 
+def resolve_camera_id(config: ConfigProvider) -> Optional[int]:
+    """Resolve ``camera.id`` into the ``ANPR_Log.Camera_ID`` value to log.
+
+    ``ANPR_Log.Camera_ID`` is NOT NULL with a foreign key to ``Camera``, so this
+    id must match a seeded ``Camera`` row or MySQL rejects every event insert.
+    A non-integer value is logged and left unset rather than silently coerced,
+    which surfaces the misconfiguration as a failing write instead of writing
+    events against the wrong camera.
+    """
+    raw = _cfg(config, "camera.id", None)
+    if raw is None:
+        logger.warning(
+            "camera.id is not configured; ANPR_Log.Camera_ID is NOT NULL, so "
+            "event writes will fail until it is set to a seeded Camera row."
+        )
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.error("Invalid camera.id %r; expected an integer.", raw)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Concrete-implementation selection (purely from config values, Req 14.2, 14.4)
 # ---------------------------------------------------------------------------
@@ -305,13 +328,23 @@ def build_access_controller(
     event_log_repo: EventLogRepository,
     gate: GateController,
     environment_label: Optional[EnvironmentLabel],
+    camera_id: Optional[int] = None,
+    image_store: Optional[DiskImageStore] = None,
 ) -> AccessController:
-    """Wire the pure access-control orchestrator over its collaborators."""
+    """Wire the pure access-control orchestrator over its collaborators.
+
+    ``camera_id`` comes from ``camera.id`` and is stamped onto every logged
+    event: ``ANPR_Log.Camera_ID`` is NOT NULL with a foreign key to ``Camera``.
+    ``image_store`` lets the controller attach a captured image to the logged
+    event once MySQL has assigned its ``Log_ID``.
+    """
     return AccessController(
         resident_repo,
         event_log_repo,
         gate,
         environment_label=environment_label,
+        camera_id=camera_id,
+        image_store=image_store,
     )
 
 
@@ -413,7 +446,12 @@ def build_application(
     normalizer = PlateNormalizer()
     ocr_engine = build_ocr_engine(config)
     access_controller = build_access_controller(
-        resident_repo, event_log_repo, gate, environment_label
+        resident_repo,
+        event_log_repo,
+        gate,
+        environment_label,
+        camera_id=resolve_camera_id(config),
+        image_store=image_store,
     )
 
     # Step 6: load detector weights BEFORE constructing/starting the pipeline
@@ -517,8 +555,14 @@ def main(
     gate = build_gate(config, hardware_interface=hardware_interface)
     normalizer = PlateNormalizer()
     ocr_engine = build_ocr_engine(config)
+    camera_id = resolve_camera_id(config)
     access_controller = build_access_controller(
-        resident_repo, event_log_repo, gate, environment_label
+        resident_repo,
+        event_log_repo,
+        gate,
+        environment_label,
+        camera_id=camera_id,
+        image_store=image_store,
     )
 
     # Load detector weights BEFORE the pipeline starts (Req 2.1, 2.5).
@@ -562,6 +606,7 @@ def main(
         config=config,
         image_store=image_store,
         environment_label=environment_label,
+        camera_id=camera_id,
         frame_provider=pipeline.latest_feed,
     )
 

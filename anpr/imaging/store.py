@@ -4,8 +4,16 @@ The ``Image_Store`` captures the frame image for a detection event, writes an
 efficiently compressed snapshot plus a small thumbnail to a configured storage
 location, and records a *reference* to those on-disk files in the database.
 Full image binaries are never stored in the database (Requirement 11.3): the
-``images`` table holds only the snapshot/thumbnail paths and the capture time,
+``Images`` table holds only the snapshot/thumbnail paths and the capture time,
 so the store can serve thumbnails and prune old images later.
+
+Capture is a **two-phase** operation against the ``anpr_system`` schema.
+``Images.Log_ID`` is a NOT NULL foreign key to ``ANPR_Log.Log_ID``, which MySQL
+only assigns when the event is logged; but the snapshot path must already be
+known at that point, because it is written to ``ANPR_Log.Image_Ref``. So
+:meth:`DiskImageStore.capture_and_store` writes the files and returns a
+reference, and :meth:`DiskImageStore.record_reference` inserts the database row
+afterwards using the generated ``Log_ID``.
 
 Behavioural contract (design Image_Store section, Req 11):
 
@@ -13,12 +21,15 @@ Behavioural contract (design Image_Store section, Req 11):
   compressed snapshot whose file size is *strictly smaller* than the original
   captured frame, plus a thumbnail whose longest edge does not exceed the
   configured maximum (default 320 px), persists both to the configured storage
-  location, records the reference in the database, and completes within the
-  capture window (≤1000 ms) (Req 11.1-11.4). On a capture-encoding failure it
+  location, and completes within the capture window (≤1000 ms)
+  (Req 11.1-11.4). On a capture-encoding failure it
   returns ``None`` so the caller keeps the Event_Log record without an image
   reference and marks the image unavailable (Req 11.7). On a storage
   failure (location unavailable or disk full) it logs an error identifying the
   storage location and returns ``None`` (Req 11.8).
+* :meth:`DiskImageStore.record_reference` — records the on-disk reference against
+  a logged event's ``Log_ID``; returns ``False`` on a database fault so the event
+  stays logged (Req 11.3).
 * :meth:`DiskImageStore.get_thumbnail` — serves the thumbnail bytes for a stored
   reference so the Guard_Dashboard shows the small image (Req 11.5).
 * :meth:`DiskImageStore.run_retention` — deletes stored images older than the
@@ -209,18 +220,13 @@ class DiskImageStore:
             captured_at=captured_at,
         )
 
-        # 3) Record the reference in the database (Req 11.3: references only).
-        try:
-            self._insert_reference(ref)
-        except Exception as exc:  # noqa: BLE001 - treat any DB fault as storage failure
-            logger.error(
-                "Failed to record image reference for event %s at storage location '%s': %s",
-                event_id,
-                self._image_dir,
-                exc,
-            )
-            _best_effort_unlink(snapshot_path, thumbnail_path)
-            return None
+        # NOTE: no database row is written here. ``Images.Log_ID`` is a NOT NULL
+        # foreign key to ``ANPR_Log.Log_ID``, and that id only exists once the
+        # event has been logged -- while the snapshot *path* must be known before
+        # the log insert, because it is stored in ``ANPR_Log.Image_Ref``. Capture
+        # is therefore split in two: this method writes the files and returns the
+        # reference, and :meth:`record_reference` inserts the row afterwards with
+        # the generated ``Log_ID`` (Req 11.3: references only, never binaries).
 
         # Req 11.1: capture is expected to complete within the capture window.
         elapsed_ms = (time.monotonic() - started) * 1000.0
@@ -254,24 +260,29 @@ class DiskImageStore:
         cutoff = _as_aware(now) - timedelta(days=self._retention_days)
 
         rows = self._db.query(
-            "SELECT event_id, snapshot_path, thumbnail_path, captured_at FROM images"
+            "SELECT Image_ID AS image_id, Snapshot_Path AS snapshot_path, "
+            "Thumbnail_Path AS thumbnail_path, Captured_At AS captured_at "
+            "FROM Images"
         )
 
-        expired_ids: list[str] = []
+        expired_ids: list[int] = []
         for row in rows:
-            captured_at = _parse_iso(row["captured_at"])
+            captured_at = _parse_timestamp(row["captured_at"])
             if captured_at is None:
                 # A reference we cannot interpret is left untouched rather than
                 # risking deletion of an image that may still be within period.
                 logger.warning(
                     "Skipping retention for image %s: unparseable capture time '%s'.",
-                    row["event_id"],
+                    row["image_id"],
                     row["captured_at"],
                 )
                 continue
             if captured_at < cutoff:
-                _best_effort_unlink(Path(row["snapshot_path"]), Path(row["thumbnail_path"]))
-                expired_ids.append(row["event_id"])
+                _best_effort_unlink(
+                    Path(row["snapshot_path"]),
+                    Path(row["thumbnail_path"]) if row["thumbnail_path"] else Path(),
+                )
+                expired_ids.append(int(row["image_id"]))
 
         if not expired_ids:
             return 0
@@ -279,10 +290,10 @@ class DiskImageStore:
         # The shared guarded API has no batch primitive, so each deletion runs
         # as its own guarded write (each acquires DB_Access_Lock and pings per
         # Req 8.1, 8.6). Behaviour matches the prior executemany batch.
-        for event_id in expired_ids:
+        for image_id in expired_ids:
             self._db.execute(
-                "DELETE FROM images WHERE event_id = %s",
-                (event_id,),
+                "DELETE FROM Images WHERE Image_ID = %s",
+                (image_id,),
             )
         return len(expired_ids)
 
@@ -354,24 +365,42 @@ class DiskImageStore:
             raise ImageCaptureError("OpenCV failed to encode the thumbnail.")
         return buffer.tobytes()
 
-    def _insert_reference(self, ref: ImageRef) -> None:
-        """Insert (or replace) the on-disk image reference row (Req 11.3).
+    def record_reference(self, ref: ImageRef, log_id: int) -> bool:
+        """Insert the ``Images`` row linking a stored capture to its log record.
 
-        Uses the guarded ``Database`` write API with ``%s`` placeholders and a
-        MySQL upsert (``ON DUPLICATE KEY UPDATE``) so a re-captured event_id
-        overwrites its reference, matching the prior sqlite ``INSERT OR REPLACE``
-        behaviour (Req 1.2, 1.3, 8.1, 8.6).
+        Called *after* the event has been appended to ``ANPR_Log``, because
+        ``Images.Log_ID`` is a NOT NULL foreign key to the generated ``Log_ID``.
+        Returns ``True`` when the reference was recorded and ``False`` on any
+        database fault, so a failure to record leaves the event logged and the
+        files on disk rather than propagating into the caller (Req 11.3, 11.8).
+
+        Unlike the previous implementation this performs a plain INSERT, not an
+        ``ON DUPLICATE KEY UPDATE`` upsert. In the ``anpr_system`` schema the
+        primary key is ``Image_ID`` and ``Log_ID`` carries no unique constraint,
+        so an upsert clause could never fire and would silently accumulate
+        duplicate rows instead of replacing them.
         """
-        self._db.execute(
-            "INSERT INTO images "
-            "(event_id, snapshot_path, thumbnail_path, captured_at) "
-            "VALUES (%s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE "
-            "snapshot_path=VALUES(snapshot_path), "
-            "thumbnail_path=VALUES(thumbnail_path), "
-            "captured_at=VALUES(captured_at)",
-            (ref.event_id, ref.snapshot_path, ref.thumbnail_path, ref.captured_at),
-        )
+        try:
+            self._db.execute(
+                "INSERT INTO Images "
+                "(Log_ID, Snapshot_Path, Thumbnail_Path, Captured_At) "
+                "VALUES (%s, %s, %s, %s)",
+                (
+                    int(log_id),
+                    ref.snapshot_path,
+                    ref.thumbnail_path,
+                    _to_naive_utc(ref.captured_at),
+                ),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - any DB fault is non-fatal here
+            logger.error(
+                "Failed to record image reference for log %s at storage location '%s': %s",
+                log_id,
+                self._image_dir,
+                exc,
+            )
+            return False
 
 
 # ----------------------------------------------------------------------
@@ -400,12 +429,33 @@ def _as_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _parse_iso(value: str) -> Optional[datetime]:
-    """Parse an ISO-8601 timestamp into an aware datetime, or ``None``."""
+def _parse_timestamp(value) -> Optional[datetime]:
+    """Parse a capture time into an aware datetime, or ``None`` when unusable.
+
+    Accepts both a ``datetime`` (what PyMySQL returns for a ``DATETIME`` column)
+    and an ISO-8601 string, so retention works whether the row came from MySQL or
+    from a fake/stubbed read. Naive values are assumed UTC, matching how
+    ``Captured_At`` is written.
+    """
+    if isinstance(value, datetime):
+        return _as_aware(value)
     try:
         return _as_aware(datetime.fromisoformat(value))
     except (TypeError, ValueError):
         return None
+
+
+def _to_naive_utc(value) -> Optional[datetime]:
+    """Coerce a capture time to a naive UTC ``datetime`` for a ``DATETIME`` column.
+
+    ``Images.Captured_At`` is a MySQL ``DATETIME`` with no timezone component, so
+    the offset-bearing ISO-8601 string produced by :func:`_now_iso` must be
+    converted before binding or MySQL rejects the trailing offset.
+    """
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _best_effort_unlink(*paths: Path) -> None:

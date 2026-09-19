@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from .routers import anpr_log
 from .routers import resident  
 from .routers import vehicle
 from .routers import anpr_log
@@ -25,6 +26,7 @@ app.include_router(vehicle.router)
 app.include_router(resident.router)
 app.include_router(anpr_log.router)
 
+ 
  
 @app.get("/", tags=["Health"])
 def health_check():

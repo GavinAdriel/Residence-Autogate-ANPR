@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, Numeric
+from sqlalchemy import Boolean, Column, DateTime, Integer, Numeric, String
 from sqlalchemy.sql import func
  
 from .database import Base
@@ -37,6 +38,39 @@ class ANPRLog(Base):
  
     Log_ID = Column(Integer, primary_key=True, autoincrement=True)
     Inserted_Time = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class Camera(Base):
+    """Mapping ke tabel `Camera` di database anpr_system.
+
+    Dipakai untuk mengisi filter kamera di dashboard (menggantikan daftar
+    'Gate 01/Gate 02' yang sebelumnya di-hardcode), dan menjadi target foreign
+    key `ANPR_Log.Camera_ID` yang NOT NULL.
+    """
+
+    __tablename__ = "Camera"
+
+    Camera_ID = Column(Integer, primary_key=True, autoincrement=True)
+    Camera_Name = Column(String(100), nullable=False)
+    Type = Column(String(50), nullable=True)
+    Location = Column(String(100), nullable=True)
+    IP_Address = Column(String(50), nullable=True)
+    Is_Active = Column(Boolean, nullable=False, default=True)
+    Created_At = Column(DateTime, server_default=func.now())
+
+
+class AnprLog(Base):
+    """Mapping ke tabel `ANPR_Log` di database anpr_system.
+
+    Read-only dari sisi API: baris ditulis oleh aplikasi ANPR (paket `anpr`),
+    sedangkan dashboard hanya membacanya. Kolom metrik bertipe DECIMAL dan
+    bernilai NULL bila metriknya tidak tersedia (mis. OCR timeout).
+    """
+
+    __tablename__ = "ANPR_Log"
+
+    Log_ID = Column(Integer, primary_key=True, autoincrement=True)
+    Inserted_Time = Column(DateTime, server_default=func.now())
     Camera_ID = Column(Integer, nullable=False)
     License_Plate_Number = Column(String(20), nullable=False)
     Normalized_Plate = Column(String(20), nullable=False)
@@ -47,9 +81,11 @@ class ANPRLog(Base):
     Event_Kind = Column(String(32), nullable=True)
     Grant_Method = Column(String(32), nullable=True)
     Entry_State = Column(String(32), nullable=False, server_default="OPEN")
+    Entry_State = Column(String(32), nullable=False, default="OPEN")
     Detection_Confidence = Column(Numeric(5, 4), nullable=True)
     OCR_Confidence = Column(Numeric(5, 4), nullable=True)
     Processing_Time_MS = Column(Numeric(10, 2), nullable=True)
     Environment_Label = Column(String(32), nullable=True)
     Image_Ref = Column(String(512), nullable=True)
+    Closed_By_Log_ID = Column(Integer, nullable=True)
     Closed_By_Log_ID = Column(Integer, nullable=True)

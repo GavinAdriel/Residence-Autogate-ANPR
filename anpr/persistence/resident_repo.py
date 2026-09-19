@@ -1,11 +1,19 @@
 """MySQL-backed implementation of the ``ResidentRepository`` interface.
 
-``MySqlResidentRepository`` provides read-only access to the ``residents`` table
+``MySqlResidentRepository`` provides read-only access to the resident whitelist
 (Req 3.1, 3.2). It exposes exactly one operation - ``find_by_plate`` - and no
 create/update/delete/list_all writes: the resident whitelist is managed
 externally through phpMyAdmin (Req 3.4, 6.5), so the application never needs
 write operations. Trimming the surface to a single read makes the read-only
 guarantee structural rather than merely conventional.
+
+Schema note: in the ``anpr_system`` schema the whitelist is *normalized across
+two tables*. ``Vehicle`` holds the plate (``Normalized_Plate``) and ``Resident``
+holds the owner; there is no plate column on ``Resident`` at all. A plate lookup
+therefore joins ``Vehicle`` to ``Resident`` on ``Resident_ID``. The join is an
+INNER JOIN, which is safe because ``Vehicle.Resident_ID`` is NOT NULL with an FK
+to ``Resident``: every vehicle is guaranteed an owner, so the join can never
+drop a registered plate.
 
 Persistence goes through the shared :class:`~anpr.persistence.db.Database`
 helper, which owns the single MySQL connection, the access lock, and the
@@ -25,13 +33,24 @@ from typing import Optional
 from anpr.core.models import ResidentRecord
 from anpr.persistence.db import Database
 
-# Columns selected for every read, in the order the ``ResidentRecord`` fields
-# are constructed below.
-_COLUMNS = "id, normalized_plate, created_at, updated_at"
+# Columns selected for every read, aliased to the ``ResidentRecord`` field names
+# so the row mapping stays independent of the schema's Capitalized_Snake naming.
+# ``v.Vehicle_ID`` is carried because the access controller writes it to the
+# nullable ``ANPR_Log.Vehicle_ID`` FK, and ``r.Resident_Name`` so the monitoring
+# views can show the owner without a second query.
+_COLUMNS = (
+    "r.Resident_ID AS id, "
+    "v.Normalized_Plate AS normalized_plate, "
+    "v.Vehicle_ID AS vehicle_id, "
+    "v.License_Plate_Number AS license_plate, "
+    "r.Resident_Name AS resident_name, "
+    "r.Created_At AS created_at, "
+    "r.Updated_At AS updated_at"
+)
 
 
 class MySqlResidentRepository:
-    """Read-only access to the ``residents`` table backed by MySQL.
+    """Read-only whitelist lookup over ``Vehicle`` joined to ``Resident``.
 
     Parameters
     ----------
@@ -60,19 +79,39 @@ class MySqlResidentRepository:
         if normalized_plate == "":
             return None
         rows = self._db.query(
-            f"SELECT {_COLUMNS} FROM residents "
-            "WHERE normalized_plate = %s "
-            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            f"SELECT {_COLUMNS} "
+            "FROM Vehicle AS v "
+            "JOIN Resident AS r ON r.Resident_ID = v.Resident_ID "
+            "WHERE v.Normalized_Plate = %s "
+            "ORDER BY v.Created_At ASC, v.Vehicle_ID ASC LIMIT 1",
             (normalized_plate,),
         )
         return _row_to_record(rows[0]) if rows else None
 
 
 def _row_to_record(row) -> ResidentRecord:
-    """Map a DictCursor row onto a :class:`ResidentRecord`."""
+    """Map a DictCursor row onto a :class:`ResidentRecord`.
+
+    ``id`` and the timestamps are coerced to ``str`` because MySQL returns
+    ``Resident_ID`` as an ``int`` and ``Created_At``/``Updated_At`` as
+    ``datetime`` objects, while :class:`ResidentRecord` declares them as strings.
+    """
     return ResidentRecord(
-        id=row["id"],
+        id=str(row["id"]),
         normalized_plate=row["normalized_plate"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        created_at=_as_text(row["created_at"]),
+        updated_at=_as_text(row["updated_at"]),
+        vehicle_id=(
+            int(row["vehicle_id"]) if row.get("vehicle_id") is not None else None
+        ),
+        resident_name=row.get("resident_name") or "",
+        license_plate=row.get("license_plate") or "",
     )
+
+
+def _as_text(value) -> str:
+    """Render a MySQL ``DATETIME`` (or already-string) value as ISO-8601 text."""
+    if value is None:
+        return ""
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)

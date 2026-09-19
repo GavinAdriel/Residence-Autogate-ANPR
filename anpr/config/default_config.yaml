@@ -18,6 +18,11 @@ camera:
   target_fps: 30              # 1..60
   reconnect_interval_s: 5     # 1..60
   inactivity_timeout_s: 10    # 1..30
+  # Camera.Camera_ID of the row representing this camera. Written to every
+  # ANPR_Log record, whose Camera_ID column is NOT NULL with a foreign key to
+  # Camera, so this MUST match a seeded row or every event insert is rejected.
+  # The Docker init SQL seeds Camera_ID 1 as the default gate camera.
+  id: 1
 
 model:
   weights_path: best.pt
@@ -41,7 +46,7 @@ storage:
 database:
   host: 127.0.0.1        # localhost only (Req 1.6)
   port: 3306             # matches docker-compose published port
-  name: anpr             # MYSQL_DATABASE
+  name: anpr_system      # MYSQL_DATABASE; the schema in docker/mysql/init
   user: anpr             # MYSQL_USER
   password: anprpassword # MYSQL_PASSWORD; overridable via ANPR_DATABASE__PASSWORD
 
