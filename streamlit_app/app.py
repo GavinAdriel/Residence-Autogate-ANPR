@@ -2,8 +2,8 @@ import streamlit as st
 
 from views.dashboard import show_dashboard
 from views.residents import show_residentsCRUD
-from views.anpr_logs import show_anpr_logs
 from views.vehicles import show_vehicles_API
+from views.streamlit_logs_page import show_anpr_logs
 
 st.set_page_config(
     page_title="ANPR System",

@@ -68,3 +68,16 @@ def update_vehicle(vehicle_id: int, data: dict):
 def delete_vehicle(vehicle_id: int):
     res = requests.delete(f"{API_URL}/vehicles/{vehicle_id}")
     res.raise_for_status()
+    
+def get_anpr_logs(start_date=None, end_date=None):
+
+    params = {}
+    if start_date:
+        params["start_date"] = start_date.isoformat()
+    if end_date:
+        params["end_date"] = end_date.isoformat()
+ 
+    res = requests.get(f"{API_URL}/anpr-logs", params=params)
+    res.raise_for_status()
+    return res.json()
+    
