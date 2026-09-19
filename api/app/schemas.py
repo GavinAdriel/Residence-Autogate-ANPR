@@ -58,3 +58,46 @@ class ResidentOut(ResidentBase):
     Resident_ID: int
     Created_At: datetime
     Updated_At: datetime
+
+
+class CameraOut(BaseModel):
+    """Kamera yang terdaftar; dipakai untuk mengisi filter kamera di dashboard."""
+    model_config = ConfigDict(from_attributes=True)
+
+    Camera_ID: int
+    Camera_Name: str
+    Type: Optional[str] = None
+    Location: Optional[str] = None
+    Is_Active: bool
+
+
+class AnprLogOut(BaseModel):
+    """Satu baris ANPR_Log untuk ditampilkan di Monitoring / ANPR Logs.
+
+    Metrik bertipe Optional karena kolomnya DECIMAL yang NULL-able: metrik yang
+    tidak tersedia disimpan sebagai NULL (bukan string "N/A"), dan sisi tampilan
+    yang merender NULL menjadi "N/A".
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    Log_ID: int
+    Inserted_Time: Optional[datetime] = None
+    Camera_ID: int
+    License_Plate_Number: str
+    Normalized_Plate: str
+    Guard_Plate: Optional[str] = None
+    Vehicle_ID: Optional[int] = None
+    Classification: Optional[str] = None
+    Direction: Optional[str] = None
+    Event_Kind: Optional[str] = None
+    Grant_Method: Optional[str] = None
+    Entry_State: Optional[str] = None
+    Detection_Confidence: Optional[float] = None
+    OCR_Confidence: Optional[float] = None
+    Processing_Time_MS: Optional[float] = None
+    Environment_Label: Optional[str] = None
+    Image_Ref: Optional[str] = None
+
+    # Kolom hasil join, diisi router bila kendaraannya cocok dengan whitelist.
+    Camera_Name: Optional[str] = None
+    Resident_Name: Optional[str] = None

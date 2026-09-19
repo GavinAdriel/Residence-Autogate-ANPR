@@ -26,7 +26,7 @@ pytest.importorskip("pymysql")
 
 import pymysql
 
-from anpr.persistence.db import DatabaseError, Database
+from anpr.persistence.db import REQUIRED_TABLES, DatabaseError, Database
 from tests.persistence.fake_dbapi import FakeConnection, fake_database
 
 # DDL verbs the application must never issue: the schema is owned by the Docker
@@ -86,13 +86,11 @@ def test_check_required_tables_reads_information_schema_without_ddl() -> None:
     proven here to stay read-only per Req 1.3).
     """
     db, conn = fake_database()
-    conn.queue_rows(
-        {"table_name": "residents"},
-        {"table_name": "event_log"},
-        {"table_name": "images"},
-    )
+    # Driven off REQUIRED_TABLES rather than hardcoded names, so the test tracks
+    # the schema the application actually requires.
+    conn.queue_rows(*({"table_name": name} for name in REQUIRED_TABLES))
 
-    db.check_required_tables()  # all three present -> returns cleanly
+    db.check_required_tables()  # all required present -> returns cleanly
 
     assert len(conn.executed) == 1
     stmt = conn.executed[0]

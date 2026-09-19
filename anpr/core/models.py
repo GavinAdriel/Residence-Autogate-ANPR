@@ -259,20 +259,44 @@ class EventRecord:
     closed_by_event_id: Optional[str] = None
     image_ref: Optional[str] = None  # empty/None when capture disabled/failed
     # Metrics: a valid float in 0.0..1.0 / ms, or NA_SENTINEL when unavailable.
+    # The sentinel is the *domain* representation of an absent metric; the
+    # event-log repository converts it to SQL NULL at the persistence boundary
+    # because the ANPR_Log metric columns are DECIMAL and cannot hold "N/A".
     detection_confidence: "float | str" = NA_SENTINEL
     ocr_confidence: "float | str" = NA_SENTINEL
     processing_latency_ms: "int | str" = NA_SENTINEL
     environment_label: Optional[EnvironmentLabel] = None
+    # --- anpr_system schema fields ---------------------------------------
+    # Camera_ID is NOT NULL in ANPR_Log and references the Camera table, so a
+    # record must always carry the id of the camera that produced it.
+    camera_id: Optional[int] = None
+    # Vehicle_ID is a nullable FK: set for a matched resident vehicle, NULL for
+    # a guest or an unmatched plate.
+    vehicle_id: Optional[int] = None
+    # Log_ID assigned by MySQL on insert (AUTO_INCREMENT). Populated by the
+    # repository after ``append`` so callers can attach child rows such as the
+    # Images reference, whose Log_ID FK is NOT NULL.
+    log_id: Optional[int] = None
 
 
 @dataclass
 class ResidentRecord:
-    """A registered resident plate record in the Resident_Database."""
+    """A registered resident plate record in the Resident_Database.
+
+    In the ``anpr_system`` schema the plate lives on the ``Vehicle`` table and
+    the owner on ``Resident``; a lookup therefore joins the two. ``id`` is the
+    ``Resident_ID`` and ``vehicle_id`` the matched ``Vehicle_ID``, which the
+    access controller writes to ``ANPR_Log.Vehicle_ID``. ``resident_name`` is
+    carried so the monitoring views can show the owner without a second query.
+    """
 
     id: str
     normalized_plate: str  # uppercase, alnum, Indonesian_Plate_Format
     created_at: str  # ISO-8601 with tz
     updated_at: str  # ISO-8601 with tz
+    vehicle_id: Optional[int] = None  # ANPR_Log.Vehicle_ID FK target
+    resident_name: str = ""  # Resident.Resident_Name
+    license_plate: str = ""  # Vehicle.License_Plate_Number (as registered)
 
 
 @dataclass(frozen=True)

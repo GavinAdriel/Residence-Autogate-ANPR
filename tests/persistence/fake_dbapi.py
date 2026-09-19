@@ -54,6 +54,11 @@ class CannedResult:
 
     rows: list[dict] = field(default_factory=list)
     rowcount: Optional[int] = None
+    # AUTO_INCREMENT id reported by the cursor for this statement, mirroring
+    # PyMySQL's ``cursor.lastrowid``. Used by
+    # ``Database.execute_returning_id`` when inserting into ANPR_Log, whose
+    # Log_ID is AUTO_INCREMENT.
+    lastrowid: Optional[int] = None
 
     def resolved_rowcount(self) -> int:
         return self.rowcount if self.rowcount is not None else len(self.rows)
@@ -71,6 +76,8 @@ class FakeCursor:
         self._connection = connection
         self._rows: list[dict] = []
         self.rowcount: int = -1
+        # Mirrors PyMySQL's ``cursor.lastrowid``; overwritten per execute.
+        self.lastrowid: int = 0
 
     def execute(self, sql: str, params: Any = None) -> int:
         """Record the statement, then serve the next canned result.
@@ -85,6 +92,14 @@ class FakeCursor:
             raise result
         self._rows = list(result.rows)
         self.rowcount = result.resolved_rowcount()
+        # Serve the programmed AUTO_INCREMENT id, or a monotonic fallback so an
+        # insert always yields a plausible non-zero Log_ID without the test
+        # having to spell one out.
+        self.lastrowid = (
+            result.lastrowid
+            if result.lastrowid is not None
+            else self._connection._next_autoincrement_id()
+        )
         return self.rowcount
 
     def fetchall(self) -> list[dict]:
@@ -132,16 +147,30 @@ class FakeConnection:
         self.connect_kwargs: Optional[dict] = None
         self._ping_error = ping_error
         self._results: list[Any] = []  # FIFO of CannedResult | BaseException
+        # Monotonic AUTO_INCREMENT counter backing ``cursor.lastrowid`` when a
+        # canned result does not pin an explicit id.
+        self._autoincrement_id = 0
 
     # ------------------------------------------------------------------
     # Result programming
     # ------------------------------------------------------------------
     def queue_result(
-        self, rows: Optional[list[dict]] = None, rowcount: Optional[int] = None
+        self,
+        rows: Optional[list[dict]] = None,
+        rowcount: Optional[int] = None,
+        lastrowid: Optional[int] = None,
     ) -> "FakeConnection":
         """Queue one canned result (returns self for chaining)."""
-        self._results.append(CannedResult(rows=list(rows or []), rowcount=rowcount))
+        self._results.append(
+            CannedResult(
+                rows=list(rows or []), rowcount=rowcount, lastrowid=lastrowid
+            )
+        )
         return self
+
+    def queue_insert_id(self, lastrowid: int) -> "FakeConnection":
+        """Queue a single-row INSERT result reporting ``lastrowid``."""
+        return self.queue_result(rows=[], rowcount=1, lastrowid=lastrowid)
 
     def queue_rows(self, *rows: dict) -> "FakeConnection":
         """Queue one read result made of the given dict rows."""
@@ -202,6 +231,11 @@ class FakeConnection:
         if self._results:
             return self._results.pop(0)
         return CannedResult(rows=[], rowcount=0)
+
+    def _next_autoincrement_id(self) -> int:
+        """Return the next synthetic AUTO_INCREMENT id (1, 2, 3, ...)."""
+        self._autoincrement_id += 1
+        return self._autoincrement_id
 
     # ------------------------------------------------------------------
     # Convenience assertions for tests

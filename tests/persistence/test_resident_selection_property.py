@@ -61,6 +61,11 @@ def _resident_rows(draw) -> list[dict]:
             {
                 "id": row_id,
                 "normalized_plate": draw(st.sampled_from(_PLATE_POOL)),
+                # The plate lives on Vehicle, so the deterministic tiebreak is
+                # the Vehicle_ID; keep it aligned with the row id.
+                "vehicle_id": row_id,
+                "license_plate": "",
+                "resident_name": "",
                 "created_at": created,
                 "updated_at": created,
             }
@@ -93,7 +98,7 @@ def test_find_by_plate_selects_earliest_lowest_id(rows, query) -> None:
     # The DB does the ORDER BY + LIMIT 1, so model the fake by handing back the
     # matching rows in (created_at, id) order -- what the real SQL would return.
     matches = [r for r in rows if r["normalized_plate"] == query]
-    ordered = sorted(matches, key=lambda r: (r["created_at"], r["id"]))
+    ordered = sorted(matches, key=lambda r: (r["created_at"], r["vehicle_id"]))
     conn.queue_rows(*ordered)
 
     result = repo.find_by_plate(query)
@@ -105,7 +110,9 @@ def test_find_by_plate_selects_earliest_lowest_id(rows, query) -> None:
         # The earliest-created / lowest-id row wins (Req 3.3, 3.5).
         expected = ordered[0]
         assert result is not None
-        assert result.id == expected["id"]
+        # Resident_ID arrives from MySQL as an int and is coerced to str.
+        assert result.id == str(expected["id"])
+        assert result.vehicle_id == expected["vehicle_id"]
         assert result.normalized_plate == query
         assert result.created_at == expected["created_at"]
         assert result.updated_at == expected["updated_at"]
@@ -118,7 +125,7 @@ def test_find_by_plate_selects_earliest_lowest_id(rows, query) -> None:
     upper = sql.upper()
     assert upper.startswith("SELECT")
     assert "%S" in upper  # PyMySQL placeholder, uppercased here
-    assert "ORDER BY CREATED_AT ASC, ID ASC" in upper
+    assert "ORDER BY V.CREATED_AT ASC, V.VEHICLE_ID ASC" in upper
     assert "LIMIT 1" in upper
     # Word-boundary match so the ``updated_at`` column does not trip "UPDATE".
     for forbidden in ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"):

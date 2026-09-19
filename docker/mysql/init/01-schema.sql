@@ -196,7 +196,24 @@ CREATE TABLE IF NOT EXISTS Images (
 
 
 -- =========================================================
--- 7. OPTIONAL: SYSTEM SETTINGS
+-- 7. SEED: DEFAULT GATE CAMERA
+-- =========================================================
+-- ANPR_Log.Camera_ID is NOT NULL with a foreign key to Camera, so at least one
+-- Camera row must exist before the ANPR application can log any event. This
+-- seeds Camera_ID = 1, which is the default `camera.id` in
+-- anpr/config/default_config.yaml.
+--
+-- Idempotent: INSERT IGNORE is a no-op when Camera_ID 1 already exists, since
+-- Camera_ID is the primary key.
+
+INSERT IGNORE INTO Camera
+    (Camera_ID, Camera_Name, Type, Location, IP_Address, Is_Active)
+VALUES
+    (1, 'Gate 01', 'webcam', 'Main Gate', NULL, TRUE);
+
+
+-- =========================================================
+-- 8. OPTIONAL: SYSTEM SETTINGS
 -- =========================================================
 
 CREATE TABLE IF NOT EXISTS System_Settings (

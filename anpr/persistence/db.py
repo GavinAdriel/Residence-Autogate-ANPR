@@ -36,7 +36,14 @@ CONNECT_TIMEOUT_S = 10
 
 # Tables owned by the Docker init schema that must exist before startup
 # proceeds (Req 1.5). The application never creates them.
-REQUIRED_TABLES = ("residents", "event_log", "images")
+#
+# These are the ``anpr_system`` table names: the resident whitelist is split
+# across ``Resident`` (owner) and ``Vehicle`` (plate), events are logged to
+# ``ANPR_Log``, image references live in ``Images``, and ``Camera`` supplies the
+# NOT NULL ``ANPR_Log.Camera_ID`` foreign key. Names are matched exactly, which
+# matters because MySQL table names are case-sensitive on the Linux container
+# hosting the database.
+REQUIRED_TABLES = ("Resident", "Vehicle", "Camera", "ANPR_Log", "Images")
 
 
 class DatabaseError(RuntimeError):
@@ -156,6 +163,32 @@ class Database:
                     rowcount = cur.rowcount
                 self._conn.commit()
                 return rowcount
+            except pymysql.MySQLError as exc:
+                self._conn.rollback()
+                raise DatabaseError(str(exc)) from exc
+        # lock released by the `with` block even when the body raises (Req 8.5)
+
+    def execute_returning_id(self, sql: str, params: tuple = ()) -> int:
+        """Run an INSERT and return the AUTO_INCREMENT id it generated.
+
+        Same lock / liveness / commit / rollback policy as :meth:`execute`
+        (Req 8.1-8.7); the only difference is that the cursor's ``lastrowid`` is
+        read *inside* the lock, before any other statement can run on the shared
+        connection. Reading it after releasing the lock would race with a
+        concurrent insert and could return another row's id.
+
+        Needed because ``ANPR_Log.Log_ID`` is ``AUTO_INCREMENT``: the
+        application no longer supplies its own event id, and child rows such as
+        ``Images`` require the generated ``Log_ID`` for their NOT NULL FK.
+        """
+        with self._lock:  # Req 8.1, 8.3, 8.4
+            self._ping_or_raise()  # Req 8.6, 8.7
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    new_id = cur.lastrowid
+                self._conn.commit()
+                return int(new_id)
             except pymysql.MySQLError as exc:
                 self._conn.rollback()
                 raise DatabaseError(str(exc)) from exc

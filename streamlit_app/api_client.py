@@ -68,3 +68,52 @@ def update_vehicle(vehicle_id: int, data: dict):
 def delete_vehicle(vehicle_id: int):
     res = requests.delete(f"{API_URL}/vehicles/{vehicle_id}")
     res.raise_for_status()
+
+
+# ---------- Camera ----------
+
+def get_cameras():
+    """Kamera terdaftar, untuk mengisi dropdown filter."""
+    res = requests.get(f"{API_URL}/cameras", timeout=TIMEOUT)
+    res.raise_for_status()
+    return res.json()
+
+
+# ---------- ANPR Log (read-only) ----------
+
+def get_anpr_logs(
+    plate: str | None = None,
+    classification: str | None = None,
+    camera_id: int | None = None,
+    limit: int = 100,
+):
+    """Log ANPR terbaru lebih dulu, dengan filter opsional.
+
+    Parameter yang bernilai None tidak dikirim, supaya API memakai defaultnya
+    dan tidak memfilter kolom tersebut.
+    """
+    params: dict = {"limit": limit}
+    if plate:
+        params["plate"] = plate
+    if classification:
+        params["classification"] = classification
+    if camera_id is not None:
+        params["camera_id"] = camera_id
+
+    res = requests.get(f"{API_URL}/anpr-logs", params=params, timeout=TIMEOUT)
+    res.raise_for_status()
+    return res.json()
+
+
+def get_latest_anpr_log():
+    """Event terakhir, atau None kalau belum ada event sama sekali."""
+    res = requests.get(f"{API_URL}/anpr-logs/latest", timeout=TIMEOUT)
+    res.raise_for_status()
+    return res.json()
+
+
+def get_anpr_stats():
+    """Ringkasan jumlah event untuk kartu metrik."""
+    res = requests.get(f"{API_URL}/anpr-logs/stats", timeout=TIMEOUT)
+    res.raise_for_status()
+    return res.json()

@@ -143,8 +143,13 @@ class EventLogRepository(Protocol):
     retired flow from being reintroduced accidentally.
     """
 
-    def append(self, record: EventRecord) -> None:
-        """Write exactly one record (exactly-once per detection)."""
+    def append(self, record: EventRecord) -> int:
+        """Write exactly one record and return its generated ``Log_ID``.
+
+        Exactly-once per detection. The returned id is the MySQL-assigned
+        ``ANPR_Log.Log_ID``, required to attach child rows such as the ``Images``
+        reference, whose ``Log_ID`` foreign key is NOT NULL.
+        """
         ...
 
 
@@ -153,7 +158,19 @@ class ImageStore(Protocol):
     """Captures, serves, and retains event frame images on disk."""
 
     def capture_and_store(self, frame: Frame, event_id: str) -> Optional[ImageRef]:
-        """Capture and persist a snapshot + thumbnail; None on failure."""
+        """Write a snapshot + thumbnail to disk; None on failure.
+
+        Writes files only. The database row is added by
+        :meth:`record_reference` once the event has a ``Log_ID``.
+        """
+        ...
+
+    def record_reference(self, ref: ImageRef, log_id: int) -> bool:
+        """Record a stored capture against a logged event's ``Log_ID``.
+
+        Returns ``False`` on a database fault, leaving the event logged and the
+        files on disk.
+        """
         ...
 
     def get_thumbnail(self, ref: ImageRef) -> bytes:
