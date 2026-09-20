@@ -30,14 +30,6 @@ class Vehicle(Base):
     Created_At = Column(DateTime, server_default=func.now())
     Updated_At = Column(DateTime, server_default=func.now(), onupdate=func.now())
     
- 
-class ANPRLog(Base):
-    """Mapping ke tabel `ANPR_Log` yang sudah ada di database anpr_system."""
- 
-    __tablename__ = "ANPR_Log"
- 
-    Log_ID = Column(Integer, primary_key=True, autoincrement=True)
-    Inserted_Time = Column(DateTime, server_default=func.now(), nullable=False)
 
 
 class Camera(Base):

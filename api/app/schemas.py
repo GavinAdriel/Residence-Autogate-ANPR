@@ -101,28 +101,6 @@ class AnprLogOut(BaseModel):
     # Kolom hasil join, diisi router bila kendaraannya cocok dengan whitelist.
     Camera_Name: Optional[str] = None
     Resident_Name: Optional[str] = None
-
-
-class ANPRLogOut(BaseModel):
-    """Response satu baris log ANPR — read-only, tidak ada Create/Update
-    karena log ini diisi otomatis oleh sistem kamera, bukan lewat form."""
-    model_config = ConfigDict(from_attributes=True)
- 
-    Log_ID: int
-    Inserted_Time: datetime
-    Camera_ID: int
-    License_Plate_Number: str
-    Normalized_Plate: str
-    Guard_Plate: Optional[str] = None
-    Vehicle_ID: Optional[int] = None
-    Classification: Optional[str] = None
-    Direction: Optional[str] = None
-    Event_Kind: Optional[str] = None
-    Grant_Method: Optional[str] = None
-    Entry_State: str
-    Detection_Confidence: Optional[Decimal] = None
-    OCR_Confidence: Optional[Decimal] = None
-    Processing_Time_MS: Optional[Decimal] = None
-    Environment_Label: Optional[str] = None
-    Image_Ref: Optional[str] = None
     Closed_By_Log_ID: Optional[int] = None
+
+
