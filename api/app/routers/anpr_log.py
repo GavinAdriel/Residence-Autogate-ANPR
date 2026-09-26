@@ -68,6 +68,11 @@ def list_anpr_logs(
         default=None, description="Filter tepat, mis. RESIDENT atau GUEST."
     ),
     camera_id: Optional[int] = Query(default=None, description="Filter per kamera."),
+    resident: Optional[bool] = Query(
+        default=None,
+        description="True = hanya kendaraan resident (Vehicle_ID terisi), "
+                     "False = hanya non-resident (Vehicle_ID NULL), kosongkan untuk semua.",
+    ),
     start_date: Optional[date] = Query(
         default=None,
         description="Tanggal mulai (YYYY-MM-DD), inklusif. Kosongkan untuk tidak membatasi dari awal.",
@@ -96,6 +101,10 @@ def list_anpr_logs(
         query = query.filter(models.AnprLog.Classification == classification)
     if camera_id is not None:
         query = query.filter(models.AnprLog.Camera_ID == camera_id)
+    if resident is True:
+        query = query.filter(models.AnprLog.Vehicle_ID.isnot(None))
+    elif resident is False:
+        query = query.filter(models.AnprLog.Vehicle_ID.is_(None))
     if start_date is not None:
         query = query.filter(
             models.AnprLog.Inserted_Time >= datetime.combine(start_date, datetime.min.time())
@@ -109,7 +118,6 @@ def list_anpr_logs(
         query.order_by(models.AnprLog.Log_ID.desc()).offset(skip).limit(limit).all()
     )
     return [_to_out(row) for row in rows]
-
 
 @router.get("/anpr-logs/latest", response_model=Optional[schemas.AnprLogOut])
 def latest_anpr_log(db: Session = Depends(get_db)):

@@ -71,9 +71,17 @@ def delete_vehicle(vehicle_id: int):
   
 # ---------- ANPR Log ----------
  
-def get_anpr_logs(start_date=None, end_date=None, plate=None, classification=None, camera_id=None):
+def get_anpr_logs(
+    start_date=None,
+    end_date=None,
+    plate=None,
+    classification=None,
+    camera_id=None,
+    resident=None,  # True = hanya resident, False = hanya non-resident, None = semua
+):
     """Semua parameter opsional dan digabung dengan AND di sisi API.
-    start_date/end_date berupa objek date, plate berupa string (partial match)."""
+    start_date/end_date berupa objek date, plate berupa string (partial match).
+    resident: True/False/None — filter berdasarkan status resident (Vehicle_ID terisi atau tidak)."""
     params = {}
     if start_date:
         params["start_date"] = start_date.isoformat()
@@ -85,8 +93,11 @@ def get_anpr_logs(start_date=None, end_date=None, plate=None, classification=Non
         params["classification"] = classification
     if camera_id is not None:
         params["camera_id"] = camera_id
- 
-    res = requests.get(f"{API_URL}/anpr-logs", params=params)
+    if resident is not None:
+        params["resident"] = resident
+
+    # print("DEBUG params:", params)
+    res = requests.get(f"{API_URL}/anpr-logs", params=params, timeout=TIMEOUT)
     res.raise_for_status()
     return res.json()
     

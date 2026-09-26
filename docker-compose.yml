@@ -46,7 +46,7 @@ services:
       PMA_PORT: 3306
       UPLOAD_LIMIT: 64M
     ports:
-      - "8080:80" #bisa ganti sesuai kebutuhan
+      - "8081:80" #bisa ganti sesuai kebutuhan
     depends_on:
       mysql:
         condition: service_healthy
