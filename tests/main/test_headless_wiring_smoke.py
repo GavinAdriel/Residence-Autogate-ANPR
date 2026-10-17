@@ -173,6 +173,11 @@ def test_pipeline_collaborators_wired(application):
     assert app.access_controller._event_log_repo is app.event_log_repo
     assert app.access_controller._gate_controller is app.gate
 
+    # The per-track dedup state is a single shared instance: the Application and
+    # the pipeline hold the very same TrackAggregator so a guard-permitted guest
+    # (resolved via the dashboard) is seen as resolved by the pipeline.
+    assert app.pipeline.track_aggregator is app.track_aggregator
+
 
 def test_no_direction_resolver_on_application_or_pipeline(application):
     """Direction resolution is retired: none on Application or pipeline (Req 9.3)."""

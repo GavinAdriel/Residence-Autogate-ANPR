@@ -3,9 +3,24 @@
 The :class:`AccessController` turns a confident, format-valid
 :class:`DetectionEvent` into an :class:`AccessDecision`: it classifies a
 recognized plate as Resident or Guest, requests the gate-open action for
-residents, records the access attempt as exactly one flat record in the
-``event_log``, and surfaces events to the Guard_Dashboard when a manual
-decision is required.
+residents, and surfaces events to the Guard_Dashboard when a manual decision is
+required.
+
+Deduplicated, action-based logging (supersedes the earlier "log every
+detection" flow): the detection pipeline collapses the many per-frame
+detections of one vehicle into a single logged event per physical pass. The
+controller participates as follows:
+
+* **Resident** -- a match writes exactly one flat ``event_log`` record and
+  requests the gate-open. The pipeline then marks the track resolved and stops
+  reading it, so a resident yields exactly one row.
+* **Guest** -- a non-match is NOT auto-logged. The controller returns a decision
+  carrying the detected plate and surfaced to the guard; the single guest row is
+  written only when the guard presses the entry-permit control. A guest the
+  guard never permits yields no row at all.
+* **Resident-lookup fault** -- still logs exactly one safety record naming the
+  normalized plate and surfaces to the guard (Req 4.6), since this is an error
+  path, not a routine guest.
 
 The controller is pure orchestration over injected collaborators and depends
 only on the Protocol interfaces defined in ``anpr.core.interfaces``
@@ -13,22 +28,26 @@ only on the Protocol interfaces defined in ``anpr.core.interfaces``
 a concrete implementation -- so simulated and field adapters are structurally
 interchangeable and chosen only in the composition root.
 
-Flat match-and-log (Requirement 4, 5):
+Match-and-log (Requirement 4, 5):
 
 * Query the ``residents`` table for an *exact* normalized-plate match on
   ``ev.normalized_plate`` (Req 4.1).
 * A match classifies the plate as Resident and requests a single gate-open via
   ``GateController.open_gate`` (Req 4.2). Gate success grants ``AUTOMATIC``
   (Req 4.3); gate failure yields ``NONE`` with ``gate_requested=True``
-  (Req 4.4).
-* No match classifies the plate as Guest: no automatic gate-open is requested
-  and the event is surfaced to the guard for a manual decision (Req 4.5).
-* A resident-lookup fault requests no automatic gate-open, logs the failure with
-  the normalized plate string, and surfaces the event to the guard (Req 4.6).
-* In **every** outcome exactly one flat :class:`EventRecord` is appended with
-  ``direction=None``, ``event_kind=None``, ``entry_state=EntryState.NA``, and
-  ``closed_by_event_id=None`` -- entry/exit correlation is retired (Req 4.7,
-  5.2, 5.3, 5.4).
+  (Req 4.4). A resident writes exactly one flat record.
+* No match classifies the plate as Guest: no automatic gate-open is requested,
+  **no record is written here**, and the event is surfaced to the guard for a
+  manual decision carrying the detected plate (Req 4.5). The guest row is
+  written later by the guard's entry-permit action.
+* A resident-lookup fault requests no automatic gate-open, logs one safety
+  record with the normalized plate string, and surfaces the event to the guard
+  (Req 4.6).
+* Every record that *is* written is flat: ``direction=None``,
+  ``event_kind=None``, ``entry_state=EntryState.NA``, and
+  ``closed_by_event_id=None`` -- entry/exit correlation is retired (Req 5.2,
+  5.3, 5.4). The earlier "exactly one record in every outcome" guarantee no
+  longer holds for guests, which are logged only on the guard's action.
 
 See .kiro/specs/mysql-monitoring-migration/design.md (Access controller) and
 requirements.md (Requirements 4 and 5) for the authoritative definitions.
@@ -132,12 +151,15 @@ class AccessController:
     # Flat match-and-log
     # ------------------------------------------------------------------
     def handle_detection(self, ev: DetectionEvent) -> AccessDecision:
-        """Flat match-and-log for one confident, format-valid detection (Req 4).
+        """Match-and-log for one confident, format-valid detection (Req 4).
 
         Returns an :class:`AccessDecision` describing the classification, the
-        grant method, whether a gate-open was requested, and whether the event
-        was surfaced to the guard for a manual decision. In every outcome
-        exactly one flat :class:`EventRecord` is appended (Req 4.7).
+        grant method, whether a gate-open was requested, whether the event was
+        surfaced to the guard, and the detected plate for a guard pre-fill. A
+        resident appends exactly one flat :class:`EventRecord` and requests the
+        gate; a guest appends nothing here (it is surfaced and logged later by
+        the guard's entry-permit action, Req 4.5); a resident-lookup fault
+        appends one safety record and surfaces (Req 4.6).
         """
         normalized_plate = ev.normalized_plate or ""
         decision = AccessDecision()
@@ -184,14 +206,24 @@ class AccessController:
                 )
         else:
             # --- Guest (Req 4.5) -------------------------------------------
+            # A guest is NOT auto-logged: no record is written at detection
+            # time. The event is surfaced to the guard carrying the detected
+            # plate, and the single guest row is written only when the guard
+            # presses the entry-permit control (see ManualGrantService). This
+            # retires the old "every detection is logged" behaviour so each
+            # physical vehicle yields exactly one row -- and a guest the guard
+            # never permits yields none.
             decision.classification = Classification.GUEST
             decision.grant_method = GrantMethod.NONE
             decision.gate_requested = False
             decision.surfaced_to_guard = True
+            decision.detected_plate = normalized_plate
             decision.reason = "No resident match; surfaced for manual decision."
+            return decision
 
-        # Exactly one flat record for the detection (Req 4.7). ``resident`` is the
-        # matched whitelist row (or None for a guest), supplying Vehicle_ID.
+        # Resident only: write exactly one flat record for the detection and
+        # attach any captured image. ``resident`` is the matched whitelist row,
+        # supplying Vehicle_ID.
         self._append_flat_record(ev, normalized_plate, decision, resident)
         return decision
 

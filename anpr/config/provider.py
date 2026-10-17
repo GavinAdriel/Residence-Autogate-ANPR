@@ -212,6 +212,13 @@ class ConfigProvider:
             "must be between 0 and 1",
         )
         check("ocr.timeout_ms", lambda v: _is_num(v) and v > 0, "must be greater than 0")
+        # pipeline (per-track deduplication). An integer grace window in frames;
+        # 0 evicts a track as soon as it is absent from a frame.
+        check(
+            "pipeline.track_staleness_frames",
+            lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 600,
+            "must be an integer between 0 and 600",
+        )
         # gate
         check("gate.mode", lambda v: v in {"simulation", "hardware"}, "must be one of {simulation, hardware}")
         check(
@@ -261,6 +268,15 @@ class ConfigProvider:
         )
         check(
             "database.password",
+            lambda v: isinstance(v, str),
+            "must be a string",
+        )
+        # Optional TLS CA-bundle path. Empty string disables TLS (local Docker);
+        # a non-empty path enables a verified, encrypted link to a remote
+        # endpoint such as AWS RDS. Only the type is constrained here; the path's
+        # existence is checked when the connection is opened.
+        check(
+            "database.ssl_ca",
             lambda v: isinstance(v, str),
             "must be a string",
         )

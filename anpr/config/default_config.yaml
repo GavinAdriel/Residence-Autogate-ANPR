@@ -32,6 +32,13 @@ ocr:
   confidence_threshold: 0.70  # 0..1
   timeout_ms: 2000
 
+pipeline:
+  # Per-track deduplication: how many consecutive frames a tracked vehicle may
+  # be absent from the detector output before its in-memory state is forgotten.
+  # One frame of grace absorbs a momentary single-frame tracker miss without
+  # prematurely forgetting a still-present vehicle (0..600).
+  track_staleness_frames: 1
+
 gate:
   mode: simulation            # simulation | hardware
   hardware_response_timeout_s: 3   # 1..30
@@ -44,11 +51,16 @@ storage:
   retention_interval_h: 24     # 1..24
 
 database:
-  host: 127.0.0.1        # localhost only (Req 1.6)
+  host: 127.0.0.1        # localhost by default; set to the AWS RDS endpoint for field
   port: 3306             # matches docker-compose published port
   name: anpr_system      # MYSQL_DATABASE; the schema in docker/mysql/init
   user: anpr             # MYSQL_USER
   password: anprpassword # MYSQL_PASSWORD; overridable via ANPR_DATABASE__PASSWORD
+  # Optional path to a PEM CA-certificate bundle. Empty = no TLS (local Docker).
+  # For a remote endpoint (e.g. AWS RDS over the internet) set this to the AWS
+  # global CA bundle so the link is encrypted and the server cert is verified.
+  # Overridable via ANPR_DATABASE__SSL_CA, e.g. a path to global-bundle.pem.
+  ssl_ca: ""
 
 network:
   # Network addresses for field deployment; present in the schema per

@@ -326,6 +326,7 @@ class ManualGrantService:
         *,
         frame: Optional[Frame] = None,
         event_id: Optional[str] = None,
+        classification: Optional[Classification] = None,
     ) -> ManualGrantResult:
         """Request the gate-open and, on success, record the manual grant.
 
@@ -335,6 +336,11 @@ class ManualGrantService:
         success, write exactly one Event_Log record marked ``grant_method =
         MANUAL`` whose guard-corrected plate value is the ``PlateNormalizer``
         output of the guard input where a plate was provided (empty otherwise).
+
+        ``classification`` tags the written row (e.g. ``Classification.GUEST``
+        when the guard permits a surfaced guest). It is the *only* row written
+        for that vehicle -- guests are no longer auto-logged at detection time,
+        so this manual grant is the guest's single Event_Log record.
         """
         eid = event_id or self._id_factory()
 
@@ -369,7 +375,7 @@ class ManualGrantService:
             ocr_plate="",
             guard_plate=normalized_plate,
             normalized_plate=normalized_plate,
-            classification=None,
+            classification=classification,
             direction=None,
             grant_method=GrantMethod.MANUAL,
             event_kind=EventKind.MANUAL,
@@ -473,6 +479,11 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         :class:`~anpr.core.models.Detection`.
     environment_label:
         Optional deployment environment stamped onto manual-grant records.
+    on_resolve_track:
+        Optional callback invoked with a resolved guest's ``track_id`` when the
+        guard permits it via Open Gate. Wired by the composition root to
+        ``TrackAggregator.mark_resolved`` so the shared dedup state marks the
+        guest's track resolved and the pipeline stops re-surfacing it.
 
     Threading note: ``on_detection`` and ``surface_event`` update Qt widgets and
     must be invoked on the GUI thread. The composition root (Task 18) is
@@ -490,6 +501,7 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         frame_provider: Optional[Callable[[], Optional[tuple[Frame, list]]]] = None,
         environment_label: Optional[EnvironmentLabel] = None,
         camera_id: Optional[int] = None,
+        on_resolve_track: Optional[Callable[[int], None]] = None,
         parent: Optional[Any] = None,
     ) -> None:
         if not _PYQT5_AVAILABLE:  # pragma: no cover - exercised only pre-install
@@ -501,6 +513,11 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
 
         self._guard_config = GuardConfig.from_config(config)
         self._frame_provider = frame_provider
+        # Invoked with a resolved guest's ``track_id`` when the guard permits it,
+        # so the composition root can mark that track resolved on the shared
+        # TrackAggregator -- the pipeline then stops re-surfacing/re-processing
+        # the guest. ``None`` keeps the dashboard standalone (e.g. in tests).
+        self._on_resolve_track = on_resolve_track
 
         # Pure collaborators (testable without a GUI).
         self._review_queue = ManualReviewQueue()
@@ -517,6 +534,14 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         # image on Open Gate.
         self._current_frame: Optional[Frame] = None
         self._current_detections: list = []
+
+        # The guest currently at the gate (if any). ``on_detection`` keeps the
+        # plate input auto-filled with this guest's best read so the guard only
+        # has to press Open Gate; a single guest is handled at a time. The edit
+        # flag suppresses auto-fill once the guard starts correcting the plate,
+        # so a fresh frame never clobbers an in-progress edit.
+        self._current_guest_event: Optional[DetectionEvent] = None
+        self._guard_edited_plate: bool = False
 
         # Last action outcome, retained for tests and status display.
         self.last_grant_result: Optional[ManualGrantResult] = None
@@ -584,6 +609,11 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         self._plate_input.setPlaceholderText("Enter plate for manual grant")
         # Req 12.3: accept up to the configured maximum character length.
         self._plate_input.setMaxLength(self._guard_config.manual_plate_max_len)
+        # ``textEdited`` fires only on user keystrokes (not programmatic
+        # ``setText``), so it marks when the guard has started correcting the
+        # plate. While edited, auto-fill from a new detection frame is
+        # suppressed so an in-progress correction is never clobbered.
+        self._plate_input.textEdited.connect(self._on_plate_text_edited)
         control_layout.addWidget(self._plate_input)
 
         self._open_gate_button = QPushButton("Open Gate", control_panel)
@@ -596,6 +626,9 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
 
         control_layout.addWidget(QLabel("Manual-review queue:", control_panel))
         self._review_list = QListWidget(control_panel)
+        # Selecting a surfaced guest pre-fills the manual plate input with its
+        # best-read plate so the guard can permit it without retyping (Req 12.3).
+        self._review_list.currentItemChanged.connect(self._on_review_selection_changed)
         control_layout.addWidget(self._review_list, 1)
 
         self._resolve_button = QPushButton("Resolve selected", control_panel)
@@ -716,11 +749,17 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
     # Top-right detection summary (Req 12.2)
     # ------------------------------------------------------------------
     def on_detection(self, event: DetectionEvent) -> None:
-        """Update the top-right panel for a new detection within the budget.
+        """Update the top-right panel and auto-fill the plate for a guest.
 
         Shows the detected plate number, the Resident/Guest tag, and the
-        detection timestamp (Req 12.2). Logs when the update exceeds the
-        configured maximum update latency.
+        detection timestamp (Req 12.2). For a **guest** at the gate this also
+        auto-fills the manual plate input with the current best read so the
+        guard only has to press Open Gate -- no queue selection needed. The
+        input keeps refreshing to the best read on later frames of the same
+        guest, unless the guard has started editing it (then the edit is
+        preserved). A non-guest or empty detection clears the current guest and,
+        when the guard has not typed anything, clears the input so no stale
+        plate can be approved by accident.
         """
         started = time.monotonic()
 
@@ -729,6 +768,8 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         self._tag_value.setText(f"Tag: {_classification_tag(event.classification)}")
         self._timestamp_value.setText(f"Time: {_format_timestamp(event.timestamp)}")
 
+        self._update_guest_autofill(event)
+
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if elapsed_ms > self._guard_config.max_update_latency_ms:
             logger.warning(
@@ -736,6 +777,41 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
                 elapsed_ms,
                 self._guard_config.max_update_latency_ms,
             )
+
+    def _update_guest_autofill(self, event: DetectionEvent) -> None:
+        """Keep the plate input tracking the current guest's best read.
+
+        A guest detection becomes (or stays) the current guest and auto-fills
+        the input with its best-read normalized plate, as long as the guard has
+        not started editing the field. Any non-guest detection means no guest is
+        awaiting a manual grant, so the current guest is cleared and the input is
+        reset (unless the guard has typed into it).
+        """
+        is_guest = event.classification is Classification.GUEST
+        if not is_guest:
+            # No guest at the gate right now.
+            self._current_guest_event = None
+            if not self._guard_edited_plate:
+                self._clear_plate_input()
+            return
+
+        self._current_guest_event = event
+        if self._guard_edited_plate:
+            # Preserve an in-progress correction; do not clobber it.
+            return
+        plate = event.normalized_plate or ""
+        if plate:
+            # Programmatic set: does not trip the ``textEdited`` guard.
+            self._plate_input.setText(plate)
+
+    def _on_plate_text_edited(self, _text: str) -> None:
+        """Mark that the guard has manually edited the plate input."""
+        self._guard_edited_plate = True
+
+    def _clear_plate_input(self) -> None:
+        """Clear the plate input and reset the manual-edit flag."""
+        self._plate_input.clear()
+        self._guard_edited_plate = False
 
     # ------------------------------------------------------------------
     # Manual-review queue (Req 12.7)
@@ -788,6 +864,31 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         if token is not None:
             self.resolve_event(int(token))
 
+    def _on_review_selection_changed(self, current: Any, _previous: Any) -> None:
+        """Pre-fill the plate input from the selected guest's best read (Req 12.3).
+
+        Selecting a surfaced guest copies its best-read normalized plate into the
+        manual input so the guard can permit it with a single Open Gate click,
+        while still being free to edit the value. A non-guest surfaced entry
+        (e.g. a lookup fault) leaves the input untouched.
+        """
+        if current is None:
+            return
+        token = current.data(Qt.UserRole)
+        if token is None:
+            return
+        event = self._event_for_token(int(token))
+        plate = getattr(event, "normalized_plate", None) if event is not None else None
+        if plate:
+            self._plate_input.setText(plate)
+
+    def _event_for_token(self, token: int) -> Optional[DetectionEvent]:
+        """Return the surfaced ``DetectionEvent`` for ``token`` (or ``None``)."""
+        for entry in self._review_queue.pending:
+            if entry.token == token:
+                return entry.event
+        return None
+
     # ------------------------------------------------------------------
     # Open Gate (Req 12.4-12.6)
     # ------------------------------------------------------------------
@@ -800,8 +901,32 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         error identifying the failed action and marks nothing granted (Req 12.6).
         """
         plate_text = self._plate_input.text().strip()
+
+        # Resolve which guest this grant is for. The primary flow is the guest
+        # currently at the gate (auto-filled by ``on_detection``); whatever plate
+        # is in the input -- the auto-filled best read or the guard's correction
+        # -- is what gets recorded. If no current guest is set, fall back to a
+        # selected review-queue entry (legacy path).
+        guest_event = self._current_guest_event
+        selected_token: Optional[int] = None
+        if guest_event is None:
+            selected_item = self._review_list.currentItem()
+            if selected_item is not None:
+                raw_token = selected_item.data(Qt.UserRole)
+                if raw_token is not None:
+                    selected_token = int(raw_token)
+                    guest_event = self._event_for_token(selected_token)
+
+        # A guest grant (current guest or selected entry) is tagged GUEST; a
+        # bare manual open with no guest context stays untagged.
+        classification = (
+            Classification.GUEST if guest_event is not None else None
+        )
+
         result = self._grant_service.record_manual_grant(
-            plate_text or None, frame=self._current_frame
+            plate_text or None,
+            frame=self._current_frame,
+            classification=classification,
         )
         self.last_grant_result = result
 
@@ -814,6 +939,52 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
             granted_plate = result.record.normalized_plate if result.record else ""
             suffix = f" (plate {granted_plate})" if granted_plate else ""
             self._status_label.setText(f"Gate opened; manual grant recorded{suffix}.")
+            # One row written for this guest: resolve its track so the pipeline
+            # stops re-surfacing/re-processing it, drop any queue entry, and
+            # clear the input so the next guest starts clean (decision 2a). The
+            # vehicle now has access and will drive through.
+            self._finish_guest_grant(guest_event, selected_token)
+
+    def _finish_guest_grant(
+        self, guest_event: Optional[DetectionEvent], selected_token: Optional[int]
+    ) -> None:
+        """Clean up after a successful guest grant.
+
+        Marks the guest's track resolved via ``on_resolve_track`` (so the
+        pipeline skips it thereafter), removes any matching review-queue entry,
+        clears the current-guest reference, and resets the plate input so no
+        stale plate lingers for the next vehicle.
+        """
+        track_id = (
+            getattr(guest_event, "track_id", None) if guest_event is not None else None
+        )
+        if track_id is not None and self._on_resolve_track is not None:
+            try:
+                self._on_resolve_track(int(track_id))
+            except Exception:  # noqa: BLE001 - a callback fault must not crash the UI
+                logger.error(
+                    "on_resolve_track callback failed for track %s.",
+                    track_id,
+                    exc_info=True,
+                )
+
+        # Remove a matching queue entry if one exists (legacy selection path, or
+        # the same guest that was also surfaced into the queue).
+        token = selected_token
+        if token is None and track_id is not None:
+            token = self._token_for_track(track_id)
+        if token is not None:
+            self.resolve_event(token)
+
+        self._current_guest_event = None
+        self._clear_plate_input()
+
+    def _token_for_track(self, track_id: int) -> Optional[int]:
+        """Return the review-queue token whose event has ``track_id`` (or None)."""
+        for entry in self._review_queue.pending:
+            if getattr(entry.event, "track_id", None) == track_id:
+                return entry.token
+        return None
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt override name
         """Stop the feed timer on window close."""

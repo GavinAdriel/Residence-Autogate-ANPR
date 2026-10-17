@@ -166,6 +166,11 @@ def test_handle_detection_outcome_mapping(ev, repo_mode, gate_success) -> None:
         assert decision.gate_requested is False
         assert decision.grant_method is GrantMethod.NONE
         assert decision.surfaced_to_guard is True
+        # A guest is NOT auto-logged; the single row is written later by the
+        # guard's entry-permit action (Req 4.5).
+        assert len(event_log_repo.records) == 0
+        # The detected plate is exposed for the guard pre-fill.
+        assert decision.detected_plate == (ev.normalized_plate or "")
     else:  # repo_mode == "raise"
         # --- Resident-lookup fault (Req 4.6) ---------------------------
         # Classification is left unset on a lookup fault.
