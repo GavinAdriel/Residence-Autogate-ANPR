@@ -1,16 +1,20 @@
 """Property-based test for the single flat Event_Log record invariant.
 
 Feature: mysql-monitoring-migration, Property 3
-Property 3: Exactly one flat EventRecord per detection.
+Property 3: Exactly one flat EventRecord per *logged* detection.
 
-``AccessController.handle_detection(ev)`` appends *exactly one*
-:class:`~anpr.core.models.EventRecord` in every outcome -- Resident (gate
-success or failure), Guest, and resident-lookup fault -- via
-``_append_flat_record`` (Req 4.7). Every such record is *flat*: entry/exit
-correlation is retired, so ``direction`` and ``event_kind`` are ``None``,
-``entry_state`` is ``EntryState.NA`` (serialized "N/A"), and
-``closed_by_event_id`` is ``None`` (Req 5.2, 5.3, 5.4). The carried fields
-(normalized plate, classification, grant method) match the returned decision.
+For a **logged** outcome -- Resident (gate success or failure) and
+resident-lookup fault -- ``AccessController.handle_detection(ev)`` appends
+*exactly one* :class:`~anpr.core.models.EventRecord` via ``_append_flat_record``.
+A **guest** is no longer auto-logged: its single row is written later by the
+guard's entry-permit action, so ``handle_detection`` appends *zero* records for
+a guest and instead surfaces it carrying the detected plate (Req 4.5).
+
+Every record that is written is *flat*: entry/exit correlation is retired, so
+``direction`` and ``event_kind`` are ``None``, ``entry_state`` is
+``EntryState.NA`` (serialized "N/A"), and ``closed_by_event_id`` is ``None``
+(Req 5.2, 5.3, 5.4). The carried fields (normalized plate, classification, grant
+method) match the returned decision.
 
 The test drives the controller with a *counting* fake ``EventLogRepository``
 that records every appended record, a fake ``ResidentRepository`` that returns a
@@ -122,12 +126,13 @@ def _detection_events(draw) -> DetectionEvent:
     mode=st.sampled_from(["resident", "guest", "fault"]),
     gate_success=st.booleans(),
 )
-def test_exactly_one_flat_record_per_detection(ev, mode, gate_success) -> None:
-    """Validates: Requirements 4.7, 5.2, 5.3, 5.4
+def test_exactly_one_flat_record_per_logged_detection(ev, mode, gate_success) -> None:
+    """Validates: Requirements 4.5, 5.2, 5.3, 5.4
 
-    Across resident / guest / fault inputs, ``handle_detection`` appends exactly
+    For a logged outcome (resident / fault) ``handle_detection`` appends exactly
     one flat record whose correlation fields are cleared and whose plate,
-    classification, and grant method match the returned decision.
+    classification, and grant method match the returned decision. A guest
+    appends zero records and is surfaced with the detected plate (Req 4.5).
     """
     normalized_plate = ev.normalized_plate or ""
     resident = _resident_for(normalized_plate) if mode == "resident" else None
@@ -142,7 +147,17 @@ def test_exactly_one_flat_record_per_detection(ev, mode, gate_success) -> None:
 
     decision = controller.handle_detection(ev)
 
-    # Exactly one record appended, in every outcome (Req 4.7).
+    if mode == "guest":
+        # A guest is NOT auto-logged; the row is written later by the guard.
+        assert len(event_log.records) == 0
+        assert decision.event_record is None
+        assert decision.classification is Classification.GUEST
+        assert decision.grant_method is GrantMethod.NONE
+        assert decision.surfaced_to_guard is True
+        assert decision.detected_plate == normalized_plate
+        return
+
+    # Logged outcomes: exactly one record appended.
     assert len(event_log.records) == 1
     record = event_log.records[0]
 
@@ -166,9 +181,6 @@ def test_exactly_one_flat_record_per_detection(ev, mode, gate_success) -> None:
         assert record.classification is Classification.RESIDENT
         expected_grant = GrantMethod.AUTOMATIC if gate_success else GrantMethod.NONE
         assert record.grant_method is expected_grant
-    elif mode == "guest":
-        assert record.classification is Classification.GUEST
-        assert record.grant_method is GrantMethod.NONE
     else:  # fault
         assert record.classification is None
         assert record.grant_method is GrantMethod.NONE

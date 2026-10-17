@@ -155,8 +155,13 @@ def test_resident_gate_failure_yields_none_with_gate_requested() -> None:
 # Outcome 3: Guest / no match (Req 4.5)
 # ----------------------------------------------------------------------
 @pytest.mark.unit
-def test_guest_no_match_surfaces_without_gate() -> None:
-    """No resident match classifies Guest, requests no gate, and surfaces (Req 4.5)."""
+def test_guest_no_match_surfaces_without_gate_and_without_logging() -> None:
+    """No resident match -> Guest, no gate, NO record, surfaced w/ plate (Req 4.5).
+
+    Guests are no longer auto-logged: the single guest row is written later by
+    the guard's entry-permit action, so the controller appends nothing here and
+    exposes the detected plate so the dashboard can pre-fill it.
+    """
     repo = FakeResidentRepository(record=None)
     gate = FakeGate(success=True)
     log = CountingEventLogRepository()
@@ -168,9 +173,13 @@ def test_guest_no_match_surfaces_without_gate() -> None:
     assert decision.grant_method is GrantMethod.NONE
     assert decision.gate_requested is False
     assert decision.surfaced_to_guard is True
+    # The detected plate is exposed for the guard pre-fill (Req 4.5).
+    assert decision.detected_plate == "B9999ZZZ"
     # No automatic gate-open for a guest (Req 4.5).
     assert gate.open_calls == []
-    assert log.append_count == 1
+    # A guest is NOT auto-logged; nothing is appended at detection time.
+    assert log.append_count == 0
+    assert decision.event_record is None
 
 
 # ----------------------------------------------------------------------
@@ -201,12 +210,16 @@ def test_lookup_fault_surfaces_without_gate_and_no_classification() -> None:
 # Every outcome appends exactly one flat record
 # ----------------------------------------------------------------------
 @pytest.mark.unit
-def test_every_outcome_appends_exactly_one_flat_record() -> None:
-    """Resident, guest, and fault inputs each append exactly one flat record."""
+def test_logged_outcomes_append_exactly_one_flat_record() -> None:
+    """Resident and fault inputs each append exactly one flat record.
+
+    Residents (gate success or failure) and the resident-lookup fault safety
+    path each write exactly one flat record. Guests write nothing here and are
+    covered separately.
+    """
     scenarios = [
         (FakeResidentRepository(record=_resident_record()), FakeGate(success=True)),
         (FakeResidentRepository(record=_resident_record()), FakeGate(success=False)),
-        (FakeResidentRepository(record=None), FakeGate(success=True)),
         (FakeResidentRepository(raises=RuntimeError("db down")), FakeGate(success=True)),
     ]
 
@@ -223,6 +236,18 @@ def test_every_outcome_appends_exactly_one_flat_record() -> None:
         assert record.event_kind is None
         assert record.entry_state is EntryState.NA
         assert record.closed_by_event_id is None
+
+
+@pytest.mark.unit
+def test_guest_outcome_appends_no_record() -> None:
+    """A guest detection writes no record at detection time (Req 4.5)."""
+    repo = FakeResidentRepository(record=None)
+    log = CountingEventLogRepository()
+    controller = AccessController(repo, log, FakeGate(success=True))
+
+    controller.handle_detection(_event("B9999ZZZ"))
+
+    assert log.append_count == 0
 
 
 # ----------------------------------------------------------------------

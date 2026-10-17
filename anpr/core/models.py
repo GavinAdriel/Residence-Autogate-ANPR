@@ -214,13 +214,22 @@ class DetectionEvent:
 
 @dataclass
 class AccessDecision:
-    """Outcome of an Access_Controller decision for an access attempt."""
+    """Outcome of an Access_Controller decision for an access attempt.
+
+    ``detected_plate`` carries the normalized plate the controller classified so
+    a guest surfaced to the guard can have its plate pre-filled on the manual
+    entry-permit control without the guard retyping it. ``event_record`` is set
+    only when a record was actually appended; for a guest (not auto-logged, Req
+    4.5) it stays ``None`` because the single guest row is written later, by the
+    guard's Open Gate action.
+    """
 
     classification: Optional[Classification] = None
     grant_method: GrantMethod = GrantMethod.NONE
     gate_requested: bool = False
     surfaced_to_guard: bool = False
     reason: Optional[str] = None
+    detected_plate: Optional[str] = None
     event_record: Optional["EventRecord"] = None
 
 

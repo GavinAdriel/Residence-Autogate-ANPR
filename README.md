@@ -163,16 +163,20 @@ the Docker-hosted database and phpMyAdmin.
    any required table is missing.
 
 4. **Confirm the resulting `event_log` rows in phpMyAdmin:**
-   Present plates to the camera and inspect the `event_log` table. For every handled
-   detection the app appends exactly one flat row:
+   Present plates to the camera and inspect the `event_log` table. Each physical vehicle
+   pass produces **exactly one** flat row (detections are de-duplicated by tracker id, so
+   a vehicle is no longer logged once per frame):
 
-   | Detection | `classification` | `grant_method` | `direction` | `event_kind` | `entry_state` |
-   |-----------|------------------|----------------|-------------|--------------|---------------|
-   | Resident (gate opens) | `RESIDENT` | `AUTOMATIC` | NULL | NULL | `N/A` |
-   | Guest (no match) | `GUEST` | `NONE` | NULL | NULL | `N/A` |
+   | Vehicle | How it is logged | `classification` | `grant_method` | `direction` | `event_kind` | `entry_state` |
+   |---------|------------------|------------------|----------------|-------------|--------------|---------------|
+   | Resident (gate opens) | automatically, on the first confident DB match (OCR then stops for that vehicle) | `RESIDENT` | `AUTOMATIC` | NULL | NULL | `N/A` |
+   | Guest (no match) | only when the guard presses **Open Gate** for the surfaced guest | `GUEST` | `MANUAL` | NULL | NULL | `N/A` |
 
-   In both cases `direction` and `event_kind` are `NULL` and `entry_state` is the `N/A`
-   sentinel, confirming the direction-free match-and-log flow.
+   A guest is **not** auto-logged at detection time: it is surfaced to the Guard Dashboard
+   (once, carrying its best OCR read), and its single row is written when the guard permits
+   it. A guest the guard never permits produces no row at all. In every row `direction` and
+   `event_kind` are `NULL` and `entry_state` is the `N/A` sentinel, confirming the
+   direction-free match-and-log flow.
 
 Stop the database with `docker compose down` (data persists in the named volume) or
 `docker compose down -v` to delete all data.

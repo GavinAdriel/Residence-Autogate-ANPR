@@ -76,6 +76,7 @@ from anpr.persistence.db import Database, MissingTableError
 from anpr.persistence.event_log_repo import MySqlEventLogRepository
 from anpr.persistence.resident_repo import MySqlResidentRepository
 from anpr.pipeline.pipeline import DetectionPipeline
+from anpr.pipeline.track_aggregator import TrackAggregator
 from anpr.pipeline.video_source import IpCameraVideoSource, WebcamVideoSource
 
 logger = logging.getLogger(__name__)
@@ -253,14 +254,25 @@ def build_repositories(
     """
     host = str(_cfg(config, "database.host", "127.0.0.1"))
     port = int(_cfg(config, "database.port", 3306))
-    name = str(_cfg(config, "database.name", "anpr"))
+    name = str(_cfg(config, "database.name", "anpr_system"))
     user = str(_cfg(config, "database.user", "anpr"))
     password = str(_cfg(config, "database.password", ""))
+    # Optional TLS CA bundle. Empty by default (local Docker, no TLS); set to a
+    # PEM path (e.g. the AWS RDS global-bundle.pem) to encrypt a remote link.
+    ssl_ca = str(_cfg(config, "database.ssl_ca", "")) or None
 
-    logger.info("Connecting to MySQL at %s:%d (database %r).", host, port, name)
+    secured = " (TLS)" if ssl_ca else ""
+    logger.info(
+        "Connecting to MySQL at %s:%d (database %r)%s.", host, port, name, secured
+    )
     try:
         database = Database(
-            host=host, port=port, name=name, user=user, password=password
+            host=host,
+            port=port,
+            name=name,
+            user=user,
+            password=password,
+            ssl_ca=ssl_ca,
         )
     except ConnectionError as exc:
         logger.error("Cannot connect to MySQL at %s:%d: %s", host, port, exc)
@@ -356,6 +368,7 @@ def build_pipeline(
     normalizer: PlateNormalizer,
     access_controller: AccessController,
     *,
+    track_aggregator: Optional[TrackAggregator] = None,
     on_event: Optional[Callable[[Any], None]] = None,
     on_manual_review: Optional[Callable[[Any], None]] = None,
 ) -> DetectionPipeline:
@@ -364,6 +377,12 @@ def build_pipeline(
     Camera/OCR tuning values are read from configuration by
     :meth:`DetectionPipeline.from_config`; the live-feed and manual-review
     callbacks (wired to the Guard_Dashboard by :func:`main`) are forwarded here.
+
+    ``track_aggregator`` is the per-track deduplication state (one logged event
+    per vehicle). It is created here and shared with the Guard_Dashboard so a
+    guard-permitted guest marks its track resolved and is never re-surfaced or
+    re-processed. Supplying one keeps the composition root the single owner of
+    the shared instance.
     """
     return DetectionPipeline.from_config(
         config,
@@ -372,6 +391,7 @@ def build_pipeline(
         ocr_engine,
         normalizer,
         access_controller,
+        track_aggregator=track_aggregator,
         on_event=on_event,
         on_manual_review=on_manual_review,
     )
@@ -401,6 +421,7 @@ class Application:
     detector: YoloVehicleDetector
     ocr_engine: OcrEngine
     access_controller: AccessController
+    track_aggregator: TrackAggregator
     pipeline: DetectionPipeline
 
 
@@ -460,7 +481,14 @@ def build_application(
     if load_weights:
         load_detector_weights_or_halt(detector)
 
-    # Step 7: assemble the pipeline over the abstractions.
+    # Step 7: assemble the pipeline over the abstractions. The per-track
+    # deduplication state is created once here (the single owner) so it can be
+    # shared with the Guard_Dashboard for guard-permitted guest resolution.
+    track_aggregator = TrackAggregator(
+        staleness_frames=int(
+            _cfg(config, "pipeline.track_staleness_frames", 1)
+        )
+    )
     pipeline = build_pipeline(
         config,
         video_source,
@@ -468,6 +496,7 @@ def build_application(
         ocr_engine,
         normalizer,
         access_controller,
+        track_aggregator=track_aggregator,
         on_event=on_event,
         on_manual_review=on_manual_review,
     )
@@ -485,6 +514,7 @@ def build_application(
         detector=detector,
         ocr_engine=ocr_engine,
         access_controller=access_controller,
+        track_aggregator=track_aggregator,
         pipeline=pipeline,
     )
 
@@ -585,6 +615,14 @@ def main(
 
     bridge = _EventBridge()
 
+    # Per-track deduplication state shared by the pipeline and the dashboard:
+    # the pipeline logs one event per vehicle and surfaces guests, and a
+    # guard-permitted guest marks its track resolved here so it is never
+    # re-surfaced or re-processed.
+    track_aggregator = TrackAggregator(
+        staleness_frames=int(_cfg(config, "pipeline.track_staleness_frames", 1))
+    )
+
     # Assemble the pipeline with the bridge-backed callbacks (Req 12.2, 12.7).
     # Built before the dashboards so its live-feed accessor can be wired into
     # the Guard_Dashboard as the frame provider.
@@ -595,6 +633,7 @@ def main(
         ocr_engine,
         normalizer,
         access_controller,
+        track_aggregator=track_aggregator,
         on_event=bridge.detection.emit,
         on_manual_review=bridge.review.emit,
     )
@@ -608,6 +647,9 @@ def main(
         environment_label=environment_label,
         camera_id=camera_id,
         frame_provider=pipeline.latest_feed,
+        # A guard-permitted guest marks its track resolved on the shared
+        # aggregator so the pipeline stops re-surfacing/re-processing it.
+        on_resolve_track=track_aggregator.mark_resolved,
     )
 
     bridge.detection.connect(guard_dashboard.on_detection)

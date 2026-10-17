@@ -30,9 +30,17 @@ Responsibilities implemented here (task 12.2):
 * **Format gating** -- when normalization marks a plate format-invalid, surface
   the raw text together with the rejection reason for manual confirmation
   (Req 4.5).
+* **Per-track deduplication** -- collapse the many per-frame detections of one
+  vehicle (keyed by the tracker's ``track_id``) into a single logged event. A
+  resident is logged once on its first confident DB match, after which the track
+  is marked resolved and every later frame is skipped *before* OCR. A guest is
+  never auto-logged: it is surfaced to the guard once with its best read and its
+  single row is written by the guard's entry-permit action. State is held in a
+  :class:`~anpr.pipeline.track_aggregator.TrackAggregator` and tracks absent for
+  longer than ``pipeline.track_staleness_frames`` are evicted.
 * **Routing** -- route a format-valid, confident detection directly through the
-  ``AccessController``'s flat match-and-log; direction resolution is retired in
-  the monitoring migration (Req 5.1, 7.2-7.4).
+  ``AccessController``'s match-and-log; direction resolution is retired in the
+  monitoring migration (Req 5.1, 7.2-7.4).
 * **Event assembly** -- build a :class:`~anpr.core.models.DetectionEvent`
   accumulating the detection and OCR confidences and the end-to-end processing
   latency (frame acquisition -> access decision) (design Event flow, Req 15.1).
@@ -67,11 +75,17 @@ from anpr.core.interfaces import (
 )
 from anpr.core.models import (
     BoundingBox,
+    Classification,
     Detection,
     DetectionEvent,
     OcrResult,
 )
 from anpr.core.normalizer import PlateNormalizer
+from anpr.pipeline.track_aggregator import (
+    DEFAULT_STALENESS_FRAMES,
+    GuestRead,
+    TrackAggregator,
+)
 from anpr.pipeline.video_source import SourceUnavailable
 
 logger = logging.getLogger(__name__)
@@ -190,6 +204,8 @@ class DetectionPipeline:
         inactivity_timeout_s: float = DEFAULT_INACTIVITY_TIMEOUT_S,
         ocr_confidence_threshold: float = DEFAULT_OCR_CONFIDENCE_THRESHOLD,
         ocr_timeout_ms: float = DEFAULT_OCR_TIMEOUT_MS,
+        track_staleness_frames: int = DEFAULT_STALENESS_FRAMES,
+        track_aggregator: Optional[TrackAggregator] = None,
         on_manual_review: Optional[Callable[[DetectionEvent], None]] = None,
         on_event: Optional[Callable[[DetectionEvent], None]] = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -218,6 +234,16 @@ class DetectionPipeline:
         )
         self._ocr_timeout_s = max(0.0, float(ocr_timeout_ms) / 1000.0)
 
+        # Per-track deduplication state (one logged event per vehicle). An
+        # injected aggregator is shared with the Guard_Dashboard by the
+        # composition root so a guard-granted guest marks its track resolved and
+        # is never re-processed; otherwise a private one is created.
+        self._tracks = (
+            track_aggregator
+            if track_aggregator is not None
+            else TrackAggregator(staleness_frames=track_staleness_frames)
+        )
+
         self._on_manual_review = on_manual_review
         self._on_event = on_event
 
@@ -235,6 +261,11 @@ class DetectionPipeline:
         # Events awaiting a guard decision; retained until the guard resolves
         # them (Req 12.7 -- surfacing side implemented here).
         self.manual_review_queue: Deque[DetectionEvent] = deque()
+
+        # The single surfaced DetectionEvent per guest track_id, kept so a later
+        # frame with a better OCR read can refresh the plate shown on the already
+        # queued review entry (the guard sees the best read, not the first read).
+        self._surfaced_guest_events: dict[int, DetectionEvent] = {}
 
         # Most recently processed frame + detections, exposed to the
         # Guard_Dashboard live feed via :meth:`latest_feed` (Req 12.1). Written
@@ -262,10 +293,11 @@ class DetectionPipeline:
 
         Reads ``camera.target_fps`` (Req 1.1), ``camera.reconnect_interval_s``
         (Req 1.4/1.5), ``camera.inactivity_timeout_s`` (Req 1.6),
-        ``ocr.confidence_threshold`` (Req 3.4) and ``ocr.timeout_ms`` (Req 3.5),
-        falling back to the documented defaults when a key is absent. Any keyword
-        override is forwarded to the constructor (e.g. injectable clocks in
-        tests).
+        ``ocr.confidence_threshold`` (Req 3.4), ``ocr.timeout_ms`` (Req 3.5), and
+        ``pipeline.track_staleness_frames`` (the per-track eviction grace
+        window), falling back to the documented defaults when a key is absent.
+        Any keyword override is forwarded to the constructor (e.g. injectable
+        clocks or a shared ``TrackAggregator`` in tests / the composition root).
         """
         return cls(
             video_source,
@@ -284,6 +316,9 @@ class DetectionPipeline:
                 config, "ocr.confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD
             ),
             ocr_timeout_ms=_cfg(config, "ocr.timeout_ms", DEFAULT_OCR_TIMEOUT_MS),
+            track_staleness_frames=_cfg(
+                config, "pipeline.track_staleness_frames", DEFAULT_STALENESS_FRAMES
+            ),
             **overrides,
         )
 
@@ -309,6 +344,16 @@ class DetectionPipeline:
     def ocr_confidence_threshold(self) -> float:
         """Effective (clamped) OCR confidence threshold in the 0..1 range."""
         return self._ocr_confidence_threshold
+
+    @property
+    def track_aggregator(self) -> TrackAggregator:
+        """The per-track deduplication state used to log one event per vehicle.
+
+        Exposed so the composition root can share it with the Guard_Dashboard:
+        a guard-granted guest marks its track resolved here so the pipeline
+        stops re-surfacing and re-processing it.
+        """
+        return self._tracks
 
     @property
     def is_running(self) -> bool:
@@ -515,25 +560,63 @@ class DetectionPipeline:
 
         events: list[DetectionEvent] = []
         for detection in detections:
-            events.append(self._process_detection(frame, detection, acquired_at))
+            processed = self._process_detection(frame, detection, acquired_at)
+            # A resolved track is skipped before OCR and yields no event.
+            if processed is not None:
+                events.append(processed)
+
+        # Infer track end: a track absent from this frame's detections for more
+        # than the staleness window is forgotten, freeing its state and (for an
+        # unresolved guest) discarding its best read so a vehicle that reverses
+        # out before the guard permits it leaves no phantom entry.
+        active_track_ids = {
+            d.track_id for d in detections if d.track_id is not None
+        }
+        for evicted_id in self._tracks.evict_stale(active_track_ids):
+            # Drop any retained surfaced event for a forgotten track so the map
+            # does not grow without bound.
+            self._surfaced_guest_events.pop(evicted_id, None)
         return events
 
     def _process_detection(
         self, frame: Any, detection: Detection, acquired_at: float
-    ) -> DetectionEvent:
+    ) -> Optional[DetectionEvent]:
         """Process one retained detection into a routed / surfaced event.
 
-        A confident, format-valid reading is routed directly through
-        :meth:`AccessController.handle_detection` (Req 5.1, 7.2-7.4); OCR
-        failures, low-confidence reads, and format-invalid plates are surfaced
-        for manual handling instead.
+        Per-track deduplication (one logged event per vehicle):
+
+        * If the detection's ``track_id`` is already *resolved* (a resident was
+          permitted and logged, or a guest was granted by the guard), the
+          detection is skipped **before** OCR runs -- "OCR will not read the
+          plate anymore" -- and ``None`` is returned.
+        * Otherwise a confident, format-valid reading is routed through
+          :meth:`AccessController.handle_detection`: a resident match logs one
+          record, opens the gate, and marks the track resolved; a guest is kept
+          as the track's best read and surfaced to the guard exactly once,
+          without any DB write.
+
+        OCR failures, low-confidence reads, and format-invalid plates are
+        surfaced for manual handling as before. Detections lacking a
+        ``track_id`` (tracker assigned none) are not deduplicated and keep the
+        per-detection routing behaviour.
         """
+        track_id = detection.track_id
+
+        # Skip-resolved: a resolved track is ignored before any cropping/OCR.
+        if track_id is not None:
+            if self._tracks.is_resolved(track_id):
+                self._tracks.touch(track_id)  # keep it alive while in view
+                return None
+            # Register the track as seen this frame so it is not evicted while
+            # still in view, even across frames that surface for manual review.
+            self._tracks.touch(track_id)
+
         event = DetectionEvent(
             timestamp=self._wall_clock(),
             acquired_at=self._wall_clock_from_monotonic(acquired_at),
             box=detection.box,
             detection_confidence=detection.confidence,
-            track_id=detection.track_id,
+            track_id=track_id,
         )
 
         # Req 3.1: crop exactly one region for this box and pass it to the OCR
@@ -573,13 +656,70 @@ class DetectionPipeline:
             return self._surface(event, acquired_at, reason)
 
         # Req 5.1 / 7.2-7.4: a confident, format-valid reading is routed
-        # directly through the access controller's flat match-and-log; direction
+        # directly through the access controller's match-and-log; direction
         # resolution is retired in the monitoring migration.
         self._finalize_latency(event, acquired_at)
         decision = self._access.handle_detection(event)
         self._apply_decision(event, decision)
+        self._apply_track_outcome(track_id, event, decision)
         self._emit(event)
         return event
+
+    def _apply_track_outcome(
+        self, track_id: Optional[int], event: DetectionEvent, decision: Any
+    ) -> None:
+        """Update per-track dedup state from an access decision.
+
+        * **Resident** (the controller logged one record and requested the
+          gate): mark the track resolved so every later frame is skipped before
+          OCR -- the resident is logged exactly once per pass.
+        * **Guest** (surfaced, not logged): record this read as the track's best
+          so far and surface the guest to the guard **once**; the single guest
+          row is written later by the guard's entry-permit action. Repeat guest
+          frames update only the best read and are not re-surfaced.
+
+        Detections without a ``track_id`` are not deduplicated: the guest is
+        surfaced via :meth:`_apply_decision` (as before) and no track state is
+        kept.
+        """
+        if track_id is None:
+            return
+
+        classification = getattr(decision, "classification", None)
+
+        if classification is Classification.RESIDENT:
+            # Logged + gate requested by the controller: resolve the track.
+            self._tracks.mark_resolved(track_id)
+            return
+
+        if classification is Classification.GUEST:
+            # Keep the best read for the guard pre-fill; stamp the best plate
+            # back onto this event so the surfaced entry shows the best read.
+            best = self._tracks.observe_guest_read(
+                track_id,
+                GuestRead(
+                    confidence=float(event.ocr_confidence or 0.0),
+                    normalized_plate=event.normalized_plate or "",
+                    ocr_text=event.ocr_text or "",
+                ),
+            )
+            if best is not None:
+                event.normalized_plate = best.normalized_plate
+
+            # Surface the guest to the guard exactly once per track. Later
+            # frames of the same guest only refine the best read: re-stamp the
+            # already-surfaced event so the queued entry reflects the best read,
+            # without re-queuing it.
+            if not self._tracks.is_surfaced(track_id):
+                self._tracks.mark_surfaced(track_id)
+                self._surfaced_guest_events[track_id] = event
+                self._surface_to_guard(
+                    event, getattr(decision, "reason", None)
+                )
+            else:
+                surfaced = self._surfaced_guest_events.get(track_id)
+                if surfaced is not None and best is not None:
+                    surfaced.normalized_plate = best.normalized_plate
 
     # ------------------------------------------------------------------
     # Surfacing / emitting
@@ -610,18 +750,37 @@ class DetectionPipeline:
     def _apply_decision(self, event: DetectionEvent, decision: Any) -> None:
         """Reflect an ``AccessDecision`` onto the event's review flags.
 
-        When the access controller surfaced the event to the guard (guest, DB
-        fault, exit anomaly, or exit write/close fault), mirror that onto the
-        pipeline's manual-review queue so the Guard_Dashboard sees a single,
-        unified stream of events needing attention.
+        Mirrors a surfaced decision onto the pipeline's manual-review queue so
+        the Guard_Dashboard sees a single, unified stream of events needing
+        attention. A **tracked guest** is surfaced exactly once per track by
+        :meth:`_apply_track_outcome` (which owns the dedup state), so this method
+        skips the guest-surfacing for a tracked guest to avoid flooding the
+        queue with one entry per frame. Untracked guests (no ``track_id``) and
+        non-guest surfaced outcomes (e.g. a resident-lookup fault) are surfaced
+        here as before.
         """
         event.classification = decision.classification
-        if getattr(decision, "surfaced_to_guard", False):
-            event.needs_manual_review = True
-            event.manual_review_reason = decision.reason
-            self.manual_review_queue.append(event)
-            if self._on_manual_review is not None:
-                self._on_manual_review(event)
+        if not getattr(decision, "surfaced_to_guard", False):
+            return
+
+        # A tracked guest's surfacing is deduplicated per track elsewhere.
+        if (
+            event.track_id is not None
+            and decision.classification is Classification.GUEST
+        ):
+            return
+
+        self._surface_to_guard(event, decision.reason)
+
+    def _surface_to_guard(
+        self, event: DetectionEvent, reason: Optional[str]
+    ) -> None:
+        """Flag an event for manual review and notify the queue/callback once."""
+        event.needs_manual_review = True
+        event.manual_review_reason = reason
+        self.manual_review_queue.append(event)
+        if self._on_manual_review is not None:
+            self._on_manual_review(event)
 
     def _emit(self, event: DetectionEvent) -> None:
         """Notify the optional general event sink (live feed)."""

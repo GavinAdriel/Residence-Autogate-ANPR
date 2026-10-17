@@ -26,6 +26,14 @@ anpr/images/
 *.db
 best.pt
 
+# AWS RDS CA bundle (public cert, downloaded per-machine; no need to commit)
+global-bundle.pem
+*.pem
+
+# Local env files that may hold DB credentials
+.env
+*.env
+
 # OS
 .DS_Store
 Thumbs.db
