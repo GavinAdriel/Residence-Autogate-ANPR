@@ -84,25 +84,7 @@ anpr
 python -m anpr.main
 ```
 
-## Run Streamlit App
-
-```bash
-# work while inside or outside the env
-cd streamlit_app
-streamlit run app.py
-```
-
 The application launches the Guard Dashboard (live feed + gate control) and the Admin Dashboard (resident management + event log).
-
-## Run API 
-
-```bash
-docker compose up -d
-pip install -r requirements.txt
-uvicorn api.app.main:app --reload --port 8000
-```
-
-swaggernya bisa dilihat di  http://localhost:8000/docs
 
 ## Configuration
 
