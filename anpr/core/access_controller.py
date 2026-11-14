@@ -71,8 +71,10 @@ from anpr.core.models import (
     AccessDecision,
     Classification,
     DetectionEvent,
+    DirectionOutcome,
     EntryState,
     EnvironmentLabel,
+    EventKind,
     EventRecord,
     GrantMethod,
     ResidentRecord,
@@ -94,6 +96,36 @@ def _default_id_factory() -> str:
 def _metric(value: Optional[float | int]) -> "float | int | str":
     """Return a numeric metric, or ``NA_SENTINEL`` when it is unavailable."""
     return value if value is not None else NA_SENTINEL
+
+
+def _logged_direction(
+    direction: Optional[DirectionOutcome],
+) -> Optional[DirectionOutcome]:
+    """Return the direction to persist in ``ANPR_Log.Direction``.
+
+    INBOUND/OUTBOUND are persisted as-is. ``None`` (flat/single-camera) and
+    ``UNDETERMINED`` persist as NULL, matching the flat-record behavior and
+    leaving an undetermined-direction event without a misleading direction.
+    """
+    if direction in (DirectionOutcome.INBOUND, DirectionOutcome.OUTBOUND):
+        return direction
+    return None
+
+
+def _correlation_fields(
+    direction: Optional[DirectionOutcome],
+) -> "tuple[Optional[EventKind], EntryState]":
+    """Map a direction to the ``(Event_Kind, Entry_State)`` to persist.
+
+    * INBOUND -> ``(ENTRY, OPEN)`` -- this row becomes an Open_Entry_Record.
+    * OUTBOUND -> ``(EXIT, N/A)`` -- an exit has no open lifecycle of its own.
+    * None / UNDETERMINED -> ``(None, N/A)`` -- the flat single-camera record.
+    """
+    if direction is DirectionOutcome.INBOUND:
+        return EventKind.ENTRY, EntryState.OPEN
+    if direction is DirectionOutcome.OUTBOUND:
+        return EventKind.EXIT, EntryState.NA
+    return None, EntryState.NA
 
 
 class AccessController:
@@ -150,16 +182,30 @@ class AccessController:
     # ------------------------------------------------------------------
     # Flat match-and-log
     # ------------------------------------------------------------------
-    def handle_detection(self, ev: DetectionEvent) -> AccessDecision:
+    def handle_detection(
+        self,
+        ev: DetectionEvent,
+        direction: Optional[DirectionOutcome] = None,
+    ) -> AccessDecision:
         """Match-and-log for one confident, format-valid detection (Req 4).
 
-        Returns an :class:`AccessDecision` describing the classification, the
-        grant method, whether a gate-open was requested, whether the event was
-        surfaced to the guard, and the detected plate for a guard pre-fill. A
-        resident appends exactly one flat :class:`EventRecord` and requests the
-        gate; a guest appends nothing here (it is surfaced and logged later by
-        the guard's entry-permit action, Req 4.5); a resident-lookup fault
-        appends one safety record and surfaces (Req 4.6).
+        ``direction`` drives direction-specific behavior
+        (dual-camera-exit-correlation):
+
+        * ``None`` / ``UNDETERMINED`` -> the existing flat match-and-log: a
+          resident is logged + gated, a guest is surfaced, a lookup fault logs a
+          safety record and surfaces. No direction/entry-state is set. This
+          preserves the single-camera behavior and every existing caller/test.
+        * ``INBOUND`` -> a resident entry writes one ``ENTRY/OPEN/INBOUND`` row
+          and gates; a guest is surfaced (its entry ticket is written by the
+          guard's permit action).
+        * ``OUTBOUND`` -> a resident exit gates, writes one ``EXIT/N-A/OUTBOUND``
+          row, and best-effort closes any open entry; a guest exit is correlated
+          to its Open_Entry_Record (Req 5): found -> gate + EXIT row + close; none
+          -> Exit_Anomaly, surfaced to the guard with no automatic grant.
+
+        Returns an :class:`AccessDecision` describing the classification, grant
+        method, gate request, guard surfacing, and the detected plate.
         """
         normalized_plate = ev.normalized_plate or ""
         decision = AccessDecision()
@@ -182,73 +228,179 @@ class AccessController:
             decision.reason = (
                 "Resident lookup failed; surfaced for manual decision."
             )
-            # Exactly one flat record for the detection (Req 4.7). No resident is
+            # Exactly one record for the detection (Req 4.7). No resident is
             # known, so Vehicle_ID is written as NULL.
-            self._append_flat_record(ev, normalized_plate, decision, None)
+            self._append_record(ev, normalized_plate, decision, None, direction)
             return decision
 
         if resident is not None:
-            # --- Resident (Req 4.2, 4.3, 4.4) ------------------------------
-            decision.classification = Classification.RESIDENT
-            gate_result = self._gate_controller.open_gate(self._event_id(ev))
-            decision.gate_requested = True
-            if gate_result.success:
-                decision.grant_method = GrantMethod.AUTOMATIC  # (Req 4.3)
-                decision.reason = (
-                    "Resident matched; automatic gate-open requested."
-                )
-            else:
-                # The gate-open was requested but the gate reported failure;
-                # the attempt still occurred (Req 4.4).
-                decision.grant_method = GrantMethod.NONE
-                decision.reason = (
-                    f"Resident matched; gate-open failed: {gate_result.detail}"
-                )
+            return self._handle_resident(ev, normalized_plate, resident, direction)
+        return self._handle_guest(ev, normalized_plate, direction)
+
+    # ------------------------------------------------------------------
+    # Resident / guest handlers
+    # ------------------------------------------------------------------
+    def _handle_resident(
+        self,
+        ev: DetectionEvent,
+        normalized_plate: str,
+        resident: ResidentRecord,
+        direction: Optional[DirectionOutcome],
+    ) -> AccessDecision:
+        """Resident match in either direction: gate + one directional row.
+
+        A resident is authorized by the whitelist match alone, independent of
+        any entry ticket (Req 3.4). An OUTBOUND resident additionally closes any
+        prior Open_Entry_Record for its plate, best-effort (Req 3.3).
+        """
+        decision = AccessDecision()
+        decision.classification = Classification.RESIDENT
+        gate_result = self._gate_controller.open_gate(self._event_id(ev))
+        decision.gate_requested = True
+        if gate_result.success:
+            decision.grant_method = GrantMethod.AUTOMATIC  # (Req 4.3)
+            decision.reason = "Resident matched; automatic gate-open requested."
         else:
-            # --- Guest (Req 4.5) -------------------------------------------
-            # A guest is NOT auto-logged: no record is written at detection
-            # time. The event is surfaced to the guard carrying the detected
-            # plate, and the single guest row is written only when the guard
-            # presses the entry-permit control (see ManualGrantService). This
-            # retires the old "every detection is logged" behaviour so each
-            # physical vehicle yields exactly one row -- and a guest the guard
-            # never permits yields none.
-            decision.classification = Classification.GUEST
+            # The gate-open was requested but the gate reported failure; the
+            # attempt still occurred (Req 4.4).
+            decision.grant_method = GrantMethod.NONE
+            decision.reason = (
+                f"Resident matched; gate-open failed: {gate_result.detail}"
+            )
+
+        record = self._append_record(
+            ev, normalized_plate, decision, resident, direction
+        )
+        # OUTBOUND resident: best-effort close of a prior open entry (Req 3.3).
+        if direction is DirectionOutcome.OUTBOUND and record is not None:
+            self._close_open_entry(normalized_plate, record)
+        return decision
+
+    def _handle_guest(
+        self,
+        ev: DetectionEvent,
+        normalized_plate: str,
+        direction: Optional[DirectionOutcome],
+    ) -> AccessDecision:
+        """Guest (no resident match): direction-specific handling.
+
+        * INBOUND / None / UNDETERMINED -> surface for a manual decision; no row
+          is written here (the guard's permit action writes it, Req 4.5 / 4.1).
+        * OUTBOUND -> exit correlation (Req 5): look up the Open_Entry_Record; if
+          found, gate + write one EXIT row + close the entry; if none, it is an
+          Exit_Anomaly surfaced to the guard with no automatic grant.
+        """
+        if direction is DirectionOutcome.OUTBOUND:
+            return self._handle_guest_exit(ev, normalized_plate)
+
+        # INBOUND / undetermined guest: surface, write nothing now (Req 4.5).
+        decision = AccessDecision()
+        decision.classification = Classification.GUEST
+        decision.grant_method = GrantMethod.NONE
+        decision.gate_requested = False
+        decision.surfaced_to_guard = True
+        decision.detected_plate = normalized_plate
+        decision.reason = "No resident match; surfaced for manual decision."
+        return decision
+
+    def _handle_guest_exit(
+        self, ev: DetectionEvent, normalized_plate: str
+    ) -> AccessDecision:
+        """Correlate an exiting guest to its open entry ticket (Req 5).
+
+        Finds the most recent Open_Entry_Record for the plate. When found, the
+        exit is authorized: the gate is opened, one EXIT row is written, and the
+        entry is closed (best-effort). When none is found it is an Exit_Anomaly:
+        no automatic gate-open, surfaced to the guard, and no row is written here
+        (the guard's manual permit writes the exit row, Req 5.3).
+        """
+        decision = AccessDecision()
+        decision.classification = Classification.GUEST
+        decision.detected_plate = normalized_plate
+
+        try:
+            open_entry = self._find_open_entry(normalized_plate)
+        except Exception as exc:  # noqa: BLE001 - a lookup fault is a DB fault
+            # Treat like the resident-lookup fault: no auto-open, surface, log.
+            logger.error(
+                "Open-entry lookup failed for plate %r: %s", normalized_plate, exc
+            )
             decision.grant_method = GrantMethod.NONE
             decision.gate_requested = False
             decision.surfaced_to_guard = True
-            decision.detected_plate = normalized_plate
-            decision.reason = "No resident match; surfaced for manual decision."
+            decision.reason = (
+                "Exit open-entry lookup failed; surfaced for manual decision."
+            )
             return decision
 
-        # Resident only: write exactly one flat record for the detection and
-        # attach any captured image. ``resident`` is the matched whitelist row,
-        # supplying Vehicle_ID.
-        self._append_flat_record(ev, normalized_plate, decision, resident)
+        if open_entry is None:
+            # Exit_Anomaly (Req 5.3): no entry ticket -> surface, no auto grant.
+            decision.grant_method = GrantMethod.NONE
+            decision.gate_requested = False
+            decision.surfaced_to_guard = True
+            decision.is_exit_anomaly = True
+            decision.reason = (
+                "Exit with no matching entry ticket (Exit_Anomaly); "
+                "surfaced for manual decision."
+            )
+            return decision
+
+        # Matched open entry (Req 5.2): gate + one EXIT row + close the entry.
+        gate_result = self._gate_controller.open_gate(self._event_id(ev))
+        decision.gate_requested = True
+        if gate_result.success:
+            decision.grant_method = GrantMethod.AUTOMATIC
+            decision.reason = (
+                "Exiting guest matched an open entry; automatic gate-open "
+                "requested and entry closed."
+            )
+        else:
+            decision.grant_method = GrantMethod.NONE
+            decision.reason = (
+                f"Exiting guest matched an open entry; gate-open failed: "
+                f"{gate_result.detail}"
+            )
+
+        exit_record = self._append_record(
+            ev, normalized_plate, decision, None, DirectionOutcome.OUTBOUND
+        )
+        if exit_record is not None:
+            self._close_entry_record(open_entry, exit_record)
         return decision
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _append_flat_record(
+    def _append_record(
         self,
         ev: DetectionEvent,
         normalized_plate: str,
         decision: AccessDecision,
         resident: Optional[ResidentRecord],
-    ) -> None:
-        """Build and append exactly one flat record (Req 4.7, 5.2, 5.3, 5.4).
+        direction: Optional[DirectionOutcome],
+    ) -> Optional[EventRecord]:
+        """Build and append exactly one record; return it (Req 4.7, 5).
 
-        The record carries ``direction=None``, ``event_kind=None``,
-        ``entry_state=EntryState.NA`` ("N/A"), and ``closed_by_event_id=None``:
-        entry/exit correlation is retired in the monitoring migration.
+        The ``direction`` determines the correlation fields:
 
-        ``camera_id`` is stamped from configuration (``ANPR_Log.Camera_ID`` is NOT
-        NULL) and ``vehicle_id`` from the matched whitelist row, or left NULL for a
-        guest or a failed lookup. After the write the generated ``Log_ID`` is used
-        to link any captured image, which cannot happen earlier because
-        ``Images.Log_ID`` is a NOT NULL foreign key.
+        * ``None`` / ``UNDETERMINED`` -> flat record: ``direction=None``,
+          ``event_kind=None``, ``entry_state=N/A`` (unchanged single-camera
+          behavior).
+        * ``INBOUND`` -> ``Event_Kind=ENTRY``, ``Entry_State=OPEN`` (this becomes
+          the plate's Open_Entry_Record).
+        * ``OUTBOUND`` -> ``Event_Kind=EXIT``, ``Entry_State=N/A`` (an exit never
+          has its own open lifecycle; it closes a prior entry instead).
+
+        ``camera_id`` prefers the per-detection id stamped by the pipeline
+        (dual-camera mode) and falls back to the controller's configured id
+        (single-camera mode); ``ANPR_Log.Camera_ID`` is NOT NULL. ``vehicle_id``
+        comes from the matched whitelist row or is NULL for a guest/failed
+        lookup. After the write the generated ``Log_ID`` links any captured
+        image (``Images.Log_ID`` is a NOT NULL FK, so it can only follow the
+        insert). The appended record is returned so the caller can close a
+        correlated entry with the exit's ``Log_ID``.
         """
+        event_kind, entry_state = _correlation_fields(direction)
         record = EventRecord(
             id=self._event_id(ev),
             timestamp=self._timestamp(ev),
@@ -256,22 +408,97 @@ class AccessController:
             guard_plate=ev.guard_plate or "",
             normalized_plate=normalized_plate,
             classification=decision.classification,
-            direction=None,  # Req 5.3
+            direction=_logged_direction(direction),
             grant_method=decision.grant_method,
-            event_kind=None,  # Req 5.3
-            entry_state=EntryState.NA,  # Req 5.4 ("N/A")
+            event_kind=event_kind,
+            entry_state=entry_state,
             closed_by_event_id=None,
             image_ref=(ev.image_ref.snapshot_path if ev.image_ref else None),
             detection_confidence=_metric(ev.detection_confidence),
             ocr_confidence=_metric(ev.ocr_confidence),
             processing_latency_ms=_metric(ev.processing_latency_ms),
             environment_label=self._environment_label,
-            camera_id=self._camera_id,
+            camera_id=(ev.camera_id if ev.camera_id is not None else self._camera_id),
             vehicle_id=(resident.vehicle_id if resident is not None else None),
         )
         self._event_log_repo.append(record)
         decision.event_record = record
         self._link_image(ev, record)
+        return record
+
+    # ------------------------------------------------------------------
+    # Exit correlation helpers (Req 5)
+    # ------------------------------------------------------------------
+    def _find_open_entry(self, normalized_plate: str) -> Optional[EventRecord]:
+        """Find the Open_Entry_Record for a plate via the repository (Req 5.1).
+
+        Raises when the repository has no ``find_open_entry`` (a flat-mode
+        repository), which only happens if OUTBOUND handling is reached without
+        the dual-camera repository wired -- a misconfiguration surfaced to the
+        guard by the caller's fault handling rather than silently granting.
+        """
+        finder = getattr(self._event_log_repo, "find_open_entry", None)
+        if not callable(finder):
+            raise AttributeError(
+                "event-log repository has no find_open_entry; exit correlation "
+                "requires the dual-camera repository surface."
+            )
+        return finder(normalized_plate)
+
+    def _close_entry_record(
+        self, open_entry: EventRecord, exit_record: EventRecord
+    ) -> None:
+        """Close a matched open entry with the exit row's Log_ID (Req 5.2, 5.6).
+
+        Best-effort: a missing close capability, a missing Log_ID, or a close
+        affecting zero rows (already closed / race) is logged, never fatal -- the
+        exit was already authorized and must not be blocked by a bookkeeping
+        fault (Req 5.6).
+        """
+        closer = getattr(self._event_log_repo, "close_entry", None)
+        if not callable(closer):
+            logger.warning(
+                "No close_entry on repository; leaving entry %s open.",
+                open_entry.log_id,
+            )
+            return
+        if open_entry.log_id is None or exit_record.log_id is None:
+            logger.warning(
+                "Cannot close entry: missing Log_ID (entry=%s, exit=%s).",
+                open_entry.log_id,
+                exit_record.log_id,
+            )
+            return
+        try:
+            affected = closer(open_entry.log_id, exit_record.log_id)
+            if not affected:
+                logger.info(
+                    "Entry %s was already closed (0 rows affected).",
+                    open_entry.log_id,
+                )
+        except Exception as exc:  # noqa: BLE001 - close must never fail the exit
+            logger.error("Failed to close entry %s: %s", open_entry.log_id, exc)
+
+    def _close_open_entry(
+        self, normalized_plate: str, exit_record: EventRecord
+    ) -> None:
+        """Best-effort close of any open entry for a plate (resident exit, Req 3.3).
+
+        Looks up the plate's Open_Entry_Record and closes it with the exit row's
+        Log_ID. Any fault (lookup or close) is logged and swallowed so a resident
+        exit is never blocked.
+        """
+        try:
+            open_entry = self._find_open_entry(normalized_plate)
+        except Exception as exc:  # noqa: BLE001 - lookup fault must not fail exit
+            logger.error(
+                "Open-entry lookup for resident exit %r failed: %s",
+                normalized_plate,
+                exc,
+            )
+            return
+        if open_entry is not None:
+            self._close_entry_record(open_entry, exit_record)
 
     def _link_image(self, ev: DetectionEvent, record: EventRecord) -> None:
         """Attach a captured image to the logged event via its ``Log_ID``.

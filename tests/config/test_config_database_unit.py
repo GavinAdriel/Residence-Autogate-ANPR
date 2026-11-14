@@ -100,23 +100,26 @@ def test_default_config_has_no_database_location() -> None:
 # Requirement 2.6 -- no direction section, no direction.* validation error
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_default_config_has_no_direction_section() -> None:
-    """Validates: Requirements 2.6
+def test_default_config_has_direction_section_in_single_mode() -> None:
+    """The ``direction`` section is present and defaults to single-camera mode.
 
-    The configuration defines no ``direction`` section.
+    Supersedes the earlier "no direction section" expectation: the
+    dual-camera-exit-correlation feature revives ``direction.*``. The default
+    mode preserves the single-camera behavior, so single-camera deployments are
+    unaffected.
     """
     provider = ConfigProvider(env={})
 
-    with pytest.raises(KeyError):
-        provider.get_section("direction")
+    section = provider.get_section("direction")
+    assert section["mode"] == "single_camera_trajectory"
 
 
 @pytest.mark.unit
-def test_validate_emits_no_direction_error() -> None:
-    """Validates: Requirements 2.6
+def test_validate_emits_no_direction_error_in_default_mode() -> None:
+    """The shipped (single-camera default) configuration validates cleanly.
 
-    Validating the shipped (valid) configuration reports no error, and in
-    particular no error whose key targets the retired ``direction`` section.
+    In the default ``single_camera_trajectory`` mode no ``direction.*`` error is
+    reported and the whole default config is valid.
     """
     provider = ConfigProvider(env={})
     errors = provider.validate()

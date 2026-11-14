@@ -24,8 +24,35 @@ camera:
   # The Docker init SQL seeds Camera_ID 1 as the default gate camera.
   id: 1
 
+direction:
+  # single_camera_trajectory (default; motion-based INBOUND/UNDETERMINED) or
+  # dual_camera (two cameras on one lane; direction from which camera saw the car).
+  mode: single_camera_trajectory
+  # --- single_camera_trajectory tuning ---
+  min_consecutive_frames: 5
+  inbound_reference_orientation: [1, 0]
+  confidence_threshold: 0.60
+  # --- dual_camera: two cameras on one shared gate lane ---
+  # Each camera reuses the same type/address keys as the top-level `camera`
+  # block (webcam | ip). `id` must match a seeded Camera.Camera_ID row
+  # (the Docker init seeds 1=inbound, 2=outbound). Only read when mode=dual_camera.
+  cameras:
+    inbound:
+      id: 1
+      type: ip
+      stream_url: ""
+    outbound:
+      id: 2
+      type: ip
+      stream_url: ""
+  # An outbound read of a plate whose entry was opened within this many seconds
+  # is treated as the SAME pass (both cameras glimpsing one entry), not a real
+  # exit, so one pass is not double-logged. A genuine later exit correlates
+  # normally. 1..30 seconds.
+  reconciliation_window_s: 3
+
 model:
-  weights_path: best.pt
+  weights_path: best_new.pt
   detection_threshold: 0.5    # 0..1
 
 ocr:

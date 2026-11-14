@@ -206,10 +206,16 @@ CREATE TABLE IF NOT EXISTS Images (
 -- Idempotent: INSERT IGNORE is a no-op when Camera_ID 1 already exists, since
 -- Camera_ID is the primary key.
 
+-- Camera_ID 2 is the Outbound camera used by the dual-camera direction mode
+-- (direction.mode = dual_camera). ANPR_Log.Camera_ID is a NOT NULL FK, so a row
+-- must exist before the outbound pipeline logs any event. Single-camera
+-- deployments simply never reference it. A remote (e.g. RDS) database that does
+-- not run this init SQL must insert this row manually before enabling dual mode.
 INSERT IGNORE INTO Camera
     (Camera_ID, Camera_Name, Type, Location, IP_Address, Is_Active)
 VALUES
-    (1, 'Gate 01', 'webcam', 'Main Gate', NULL, TRUE);
+    (1, 'Gate 01 Inbound', 'ip', 'Main Gate', NULL, TRUE),
+    (2, 'Gate 01 Outbound', 'ip', 'Main Gate', NULL, TRUE);
 
 
 -- =========================================================

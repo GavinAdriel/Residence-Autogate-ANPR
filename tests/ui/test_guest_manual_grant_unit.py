@@ -99,3 +99,55 @@ def test_guest_manual_grant_not_written_on_gate_failure() -> None:
     assert result.recorded is False
     assert len(gate.open_calls) == 1
     assert log.records == []
+
+
+# ---------------------------------------------------------------------------
+# Exit_Anomaly manual permit (dual-camera-exit-correlation Req 5.4, 5.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_exit_anomaly_manual_grant_writes_outbound_exit_row() -> None:
+    """A guard-permitted Exit_Anomaly records an OUTBOUND EXIT row (Req 5.4)."""
+    from anpr.core.models import DirectionOutcome, EventKind
+
+    service, gate, log = _service()
+
+    result = service.record_manual_grant(
+        "B1234CD", classification=Classification.GUEST, is_exit=True
+    )
+
+    assert result.gate_success is True and result.recorded is True
+    record = log.records[0]
+    assert record.grant_method is GrantMethod.MANUAL
+    assert record.direction is DirectionOutcome.OUTBOUND
+    assert record.event_kind is EventKind.EXIT
+
+
+@pytest.mark.unit
+def test_plain_manual_grant_stays_manual_event_kind() -> None:
+    """Without is_exit, a manual grant stays a plain MANUAL event with no direction."""
+    from anpr.core.models import EventKind
+
+    service, _gate, log = _service()
+
+    service.record_manual_grant("B1234CD", classification=Classification.GUEST)
+
+    record = log.records[0]
+    assert record.event_kind is EventKind.MANUAL
+    assert record.direction is None
+
+
+@pytest.mark.unit
+def test_review_label_tags_exit_anomaly_distinctly() -> None:
+    """The review-queue label prefixes an Exit_Anomaly distinctly (Req 5.3)."""
+    from anpr.core.models import DetectionEvent
+    from anpr.ui.guard_dashboard import _review_label
+
+    normal = DetectionEvent(normalized_plate="B1CD", manual_review_reason="low conf")
+    anomaly = DetectionEvent(
+        normalized_plate="B1CD",
+        manual_review_reason="Exit with no matching entry ticket (Exit_Anomaly).",
+        is_exit_anomaly=True,
+    )
+
+    assert not _review_label(normal, None).startswith("[EXIT - NO TICKET]")
+    assert _review_label(anomaly, None).startswith("[EXIT - NO TICKET]")

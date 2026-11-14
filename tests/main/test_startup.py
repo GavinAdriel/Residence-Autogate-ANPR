@@ -96,12 +96,34 @@ ORDERED_BUILDERS = [
     "validate_config_or_halt",
     "build_repositories",
     "build_image_store",
-    "build_video_source",
     "build_gate",
     "build_detector",
     "load_detector_weights_or_halt",
-    "build_pipeline",
+    "build_camera_pipelines",
 ]
+
+
+def _fake_camera_pipelines() -> list:
+    """A minimal primary CameraPipeline list for spying build_camera_pipelines.
+
+    ``build_application`` selects the primary pipeline and reads
+    ``primary.pipeline.source`` + ``primary.track_aggregator``, so the stand-in
+    must expose those attributes.
+    """
+
+    class _StubPipeline:
+        source = object()
+
+    return [
+        main.CameraPipeline(
+            camera_id=1,
+            label="camera",
+            pipeline=_StubPipeline(),
+            track_aggregator=object(),
+            is_primary=True,
+        )
+    ]
+
 
 # Harmless stand-in return values so a recording spy can replace a real builder
 # without constructing anything real.
@@ -109,11 +131,10 @@ _FAKE_RETURNS = {
     "validate_config_or_halt": None,
     "build_repositories": None,  # replaced per-test with a fake 3-tuple
     "build_image_store": object(),
-    "build_video_source": object(),
     "build_gate": object(),
     "build_detector": object(),
     "load_detector_weights_or_halt": None,
-    "build_pipeline": object(),
+    "build_camera_pipelines": _fake_camera_pipelines(),
 }
 
 
@@ -157,11 +178,10 @@ def test_build_application_runs_startup_steps_in_documented_order(monkeypatch):
     # recorded but not delegated so no heavy YOLO weights are read.
     _spy(monkeypatch, "validate_config_or_halt", order, delegate=True)
     _spy(monkeypatch, "build_image_store", order, delegate=True)
-    _spy(monkeypatch, "build_video_source", order, delegate=True)
     _spy(monkeypatch, "build_gate", order, delegate=True)
     _spy(monkeypatch, "build_detector", order, delegate=True)
     _spy(monkeypatch, "load_detector_weights_or_halt", order, delegate=False)
-    _spy(monkeypatch, "build_pipeline", order, delegate=True)
+    _spy(monkeypatch, "build_camera_pipelines", order, delegate=True)
 
     app = main.build_application(load_weights=True)
 
@@ -170,11 +190,10 @@ def test_build_application_runs_startup_steps_in_documented_order(monkeypatch):
         "connect",
         "table-check",
         "build_image_store",
-        "build_video_source",
         "build_gate",
         "build_detector",
         "load_detector_weights_or_halt",
-        "build_pipeline",
+        "build_camera_pipelines",
     ]
     # The assembled graph is wired onto the injected fake DB.
     assert isinstance(app.database, RealDatabase)
@@ -214,9 +233,14 @@ def test_connect_failure_raises_startup_error_and_builds_no_dashboard(monkeypatc
     )
     # Downstream builders must never run once the connect fails.
     _spy(monkeypatch, "build_image_store", order, delegate=False, result=object())
-    _spy(monkeypatch, "build_video_source", order, delegate=False, result=object())
     _spy(monkeypatch, "build_gate", order, delegate=False, result=object())
-    _spy(monkeypatch, "build_pipeline", order, delegate=False, result=object())
+    _spy(
+        monkeypatch,
+        "build_camera_pipelines",
+        order,
+        delegate=False,
+        result=_fake_camera_pipelines(),
+    )
 
     pyqt_before = {m for m in sys.modules if m.startswith("PyQt5")}
 
@@ -243,7 +267,13 @@ def test_missing_table_raises_startup_error(monkeypatch):
         main, "Database", _make_fake_db_class(order, table_error=missing)
     )
     _spy(monkeypatch, "build_image_store", order, delegate=False, result=object())
-    _spy(monkeypatch, "build_pipeline", order, delegate=False, result=object())
+    _spy(
+        monkeypatch,
+        "build_camera_pipelines",
+        order,
+        delegate=False,
+        result=_fake_camera_pipelines(),
+    )
 
     with pytest.raises(StartupError) as exc_info:
         main.build_application(load_weights=False)

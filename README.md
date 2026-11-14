@@ -92,9 +92,11 @@ Configuration lives in `anpr/config/default_config.yaml`. Key settings:
 
 | Section | Setting | Description |
 |---------|---------|-------------|
-| `camera.type` | `webcam` / `ip` | Video source type |
+| `camera.type` | `webcam` / `ip` | Video source type (single-camera mode) |
 | `camera.device_index` | `0` | Webcam index |
 | `camera.target_fps` | `15` | Frame ingestion rate |
+| `direction.mode` | `single_camera_trajectory` / `dual_camera` | Direction resolution mode |
+| `direction.reconciliation_window_s` | `3` | Dual-camera same-pass window (seconds) |
 | `gate.mode` | `simulation` / `hardware` | Gate control mode |
 | `model.detection_threshold` | `0.5` | YOLO confidence threshold |
 | `ocr.confidence_threshold` | `0.70` | OCR confidence threshold |
@@ -105,6 +107,29 @@ Environment variables override config values using the `ANPR_` prefix with doubl
 ANPR_CAMERA__TARGET_FPS=30
 ANPR_GATE__MODE=hardware
 ```
+
+### Dual-camera mode (direction + exit tickets)
+
+Set `direction.mode: dual_camera` to run **two IP cameras on one shared gate lane** — one
+facing inbound traffic, one outbound. Direction is derived from which camera saw the
+vehicle, and a guest exit is correlated to its open entry ticket (an unmatched exit is
+surfaced to the guard as an Exit_Anomaly). Each camera reuses the standard
+`type` / `stream_url` keys and maps to a seeded `Camera.Camera_ID` (the Docker init seeds
+`1` = inbound, `2` = outbound):
+
+```yaml
+direction:
+  mode: dual_camera
+  cameras:
+    inbound:  { id: 1, type: ip, stream_url: "rtsp://user:pass@INBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
+    outbound: { id: 2, type: ip, stream_url: "rtsp://user:pass@OUTBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
+  reconciliation_window_s: 3
+```
+
+Single-camera mode is the default and is unaffected. The only network egress remains the
+local IP-camera stream(s) — offline-by-default still holds. A remote (e.g. RDS) database
+that does not run the Docker init SQL must insert the `Camera_ID = 2` row manually before
+enabling dual mode.
 
 ## Running Tests
 

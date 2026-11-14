@@ -180,6 +180,12 @@ class DetectionEvent:
     detection_confidence: Optional[float] = None
     track_id: Optional[int] = None
     track: Optional[TrackHistory] = None
+    # Identity of the camera that produced this detection. Stamped by the
+    # pipeline so direction can be resolved per camera (dual_camera mode) and so
+    # the correct ``ANPR_Log.Camera_ID`` (NOT NULL FK) is written per event.
+    # None in single-camera mode, where the controller's configured camera_id
+    # is used instead.
+    camera_id: Optional[int] = None
 
     # OCR / normalization
     ocr_text: Optional[str] = None
@@ -205,6 +211,11 @@ class DetectionEvent:
     # Flags for the manual-review queue
     needs_manual_review: bool = False
     manual_review_reason: Optional[str] = None
+    # True when surfaced as an OUTBOUND exit with no matching open entry
+    # (dual-camera-exit-correlation Req 5.3). Lets the Guard_Dashboard label the
+    # entry distinctly ("leaving without a ticket") and record a guard permit as
+    # an EXIT row rather than a plain manual grant.
+    is_exit_anomaly: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +242,10 @@ class AccessDecision:
     reason: Optional[str] = None
     detected_plate: Optional[str] = None
     event_record: Optional["EventRecord"] = None
+    # True when an OUTBOUND guest detection had no matching Open_Entry_Record
+    # (dual-camera-exit-correlation Req 5.3). Lets the Guard_Dashboard present a
+    # "leaving without a ticket" anomaly distinctly from a normal guest entry.
+    is_exit_anomaly: bool = False
 
 
 @dataclass(frozen=True)

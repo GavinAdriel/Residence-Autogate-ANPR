@@ -35,6 +35,7 @@ from anpr.core.models import (
     Classification,
     EntryState,
     EnvironmentLabel,
+    EventKind,
     EventRecord,
     GrantMethod,
     ResidentRecord,
@@ -383,5 +384,98 @@ def test_append_issues_no_ddl() -> None:
     conn.queue_insert_id(1)
 
     MySqlEventLogRepository(db).append(_sample_event_record())
+
+    _assert_no_ddl(conn.executed_sql)
+
+
+# ---------------------------------------------------------------------------
+# Exit correlation: find_open_entry / close_entry
+# (dual-camera-exit-correlation, Req 5)
+# ---------------------------------------------------------------------------
+def _open_entry_row(log_id: int = 10, plate: str = "B1234XYZ") -> dict:
+    """A canned ``ANPR_Log`` open-entry row as the SELECT returns it."""
+    return {
+        "Log_ID": log_id,
+        "Inserted_Time": datetime(2026, 1, 1, 8, 0, 0),
+        "Camera_ID": 1,
+        "License_Plate_Number": plate,
+        "Normalized_Plate": plate,
+        "Guard_Plate": None,
+        "Vehicle_ID": None,
+        "Classification": "GUEST",
+        "Direction": "INBOUND",
+        "Event_Kind": "ENTRY",
+        "Grant_Method": "MANUAL",
+        "Entry_State": "OPEN",
+        "Image_Ref": None,
+        "Closed_By_Log_ID": None,
+    }
+
+
+def test_find_open_entry_returns_most_recent_open_entry() -> None:
+    """``find_open_entry`` maps the newest OPEN ENTRY row onto an EventRecord (Req 5.1)."""
+    db, conn = fake_database()
+    conn.queue_rows(_open_entry_row(log_id=10))
+
+    record = MySqlEventLogRepository(db).find_open_entry("B1234XYZ")
+
+    assert record is not None
+    assert record.log_id == 10
+    assert record.event_kind is EventKind.ENTRY
+    assert record.entry_state is EntryState.OPEN
+    # The lookup filters on plate + ENTRY + OPEN (uses idx_log_open_entries).
+    sql, params = conn.executed[0].sql, conn.executed[0].params
+    assert "Entry_State" in sql and "Event_Kind" in sql
+    assert params == ("B1234XYZ", "ENTRY", "OPEN")
+
+
+def test_find_open_entry_no_match_returns_none() -> None:
+    """No open entry yields ``None`` (an Exit_Anomaly, Req 5.3)."""
+    db, conn = fake_database()
+    conn.queue_result(rows=[])
+
+    assert MySqlEventLogRepository(db).find_open_entry("B9999ZZZ") is None
+
+
+def test_find_open_entry_empty_plate_returns_none_without_query() -> None:
+    """The empty string short-circuits to ``None`` and issues no SQL."""
+    db, conn = fake_database()
+
+    assert MySqlEventLogRepository(db).find_open_entry("") is None
+    assert conn.executed == []
+
+
+def test_close_entry_updates_guarded_by_open_state() -> None:
+    """``close_entry`` issues a guarded UPDATE and returns rows affected (Req 5.2)."""
+    db, conn = fake_database()
+    conn.queue_result(rows=[], rowcount=1)
+
+    affected = MySqlEventLogRepository(db).close_entry(10, 20)
+
+    assert affected == 1
+    sql, params = conn.executed[0].sql, conn.executed[0].params
+    assert sql.strip().upper().startswith("UPDATE")
+    assert "Entry_State" in sql and "Closed_By_Log_ID" in sql
+    # Guarded by Entry_State='OPEN' so the close is idempotent/race-safe.
+    assert params == ("CLOSED", 20, 10, "OPEN")
+
+
+def test_close_entry_idempotent_zero_rows_is_not_an_error() -> None:
+    """Closing an already-closed entry affects zero rows and does not raise (Req 5.6)."""
+    db, conn = fake_database()
+    conn.queue_result(rows=[], rowcount=0)
+
+    assert MySqlEventLogRepository(db).close_entry(10, 21) == 0
+
+
+def test_find_open_entry_and_close_issue_no_ddl() -> None:
+    """Neither correlation method issues DDL (Req 1.3)."""
+    db, conn = fake_database()
+    conn.queue_rows(_open_entry_row())
+    conn.queue_result(rows=[], rowcount=1)
+
+    repo = MySqlEventLogRepository(db)
+    repo.find_open_entry("B1234XYZ")
+    repo.close_entry(10, 20)
 
     _assert_no_ddl(conn.executed_sql)
