@@ -78,6 +78,7 @@ from anpr.core.models import (
     Classification,
     Detection,
     DetectionEvent,
+    DirectionOutcome,
     OcrResult,
 )
 from anpr.core.normalizer import PlateNormalizer
@@ -118,6 +119,13 @@ MAX_OCR_CONFIDENCE_THRESHOLD = 1.0
 # OCR processing timeout, defaulting to 2000 ms (Req 3.5).
 DEFAULT_OCR_TIMEOUT_MS = 2000
 
+# Dual-camera reconciliation window (seconds). An OUTBOUND read of a plate whose
+# INBOUND entry was authorized within this window is treated as the SAME pass
+# (both cameras glimpsing one entry) and is NOT auto-exited, so one physical
+# pass is not double-logged (dual-camera-exit-correlation Req 6.2, 6.3). A
+# genuine later exit (outside the window) correlates normally (Req 6.4).
+DEFAULT_RECONCILIATION_WINDOW_S = 3.0
+
 
 # Human-readable reasons attached to events surfaced for manual handling. Kept
 # as constants so the Guard_Dashboard task and tests can match them exactly.
@@ -133,6 +141,55 @@ REVIEW_FORMAT_INVALID = "Plate is format-invalid; surfaced for manual confirmati
 def _clamp(value: float, low: float, high: float) -> float:
     """Clamp ``value`` to the inclusive ``[low, high]`` range."""
     return max(low, min(high, value))
+
+
+class RecentEntryRegistry:
+    """Shared, thread-safe memory of recently authorized INBOUND entries.
+
+    Dual-camera reconciliation: the two camera pipelines run on separate threads
+    with separate aggregators, so the OUTBOUND pipeline cannot see the INBOUND
+    pipeline's state directly. This registry is the single shared place where an
+    authorized entry records "plate P entered at time T"; the OUTBOUND pipeline
+    consults it to tell a genuine exit from the brief same-pass window in which
+    both cameras glimpse one entering car (Req 6.2, 6.3).
+
+    Times are monotonic seconds supplied by the caller so the registry stays
+    clock-injectable and testable. The composition root creates one instance and
+    shares it with both pipelines; a single-camera pipeline gets its own private
+    instance which is simply never consulted.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, float] = {}
+
+    def record_entry(self, normalized_plate: str, now: float) -> None:
+        """Record that ``normalized_plate`` was authorized INBOUND at ``now``."""
+        if not normalized_plate:
+            return
+        with self._lock:
+            self._entries[normalized_plate] = now
+
+    def entered_within(
+        self, normalized_plate: str, now: float, window_s: float
+    ) -> bool:
+        """Whether the plate entered within the last ``window_s`` seconds.
+
+        Prunes the plate's record when it is older than the window so the map
+        does not grow unbounded; a genuine later exit (outside the window) sees
+        no recent entry and correlates normally (Req 6.4).
+        """
+        if not normalized_plate or window_s <= 0:
+            return False
+        with self._lock:
+            entered_at = self._entries.get(normalized_plate)
+            if entered_at is None:
+                return False
+            if now - entered_at <= window_s:
+                return True
+            # Stale: forget it so later exits are treated as real.
+            del self._entries[normalized_plate]
+            return False
 
 
 def _default_ocr_invoker(engine: OcrEngine, crop: Any, timeout_s: float) -> OcrResult:
@@ -206,6 +263,10 @@ class DetectionPipeline:
         ocr_timeout_ms: float = DEFAULT_OCR_TIMEOUT_MS,
         track_staleness_frames: int = DEFAULT_STALENESS_FRAMES,
         track_aggregator: Optional[TrackAggregator] = None,
+        camera_id: Optional[int] = None,
+        direction_resolver: Optional[Any] = None,
+        reconciliation_window_s: float = DEFAULT_RECONCILIATION_WINDOW_S,
+        recent_entry_registry: Optional[RecentEntryRegistry] = None,
         on_manual_review: Optional[Callable[[DetectionEvent], None]] = None,
         on_event: Optional[Callable[[DetectionEvent], None]] = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -218,6 +279,19 @@ class DetectionPipeline:
         self._ocr = ocr_engine
         self._normalizer = normalizer
         self._access = access_controller
+
+        # Dual-camera direction (dual-camera-exit-correlation). In single-camera
+        # mode ``direction_resolver`` is None and no direction is resolved: the
+        # access controller keeps its flat behavior. In dual mode the resolver
+        # maps this pipeline's ``camera_id`` to a DirectionOutcome, stamped on
+        # each event and passed to the controller.
+        self._camera_id = camera_id
+        self._direction_resolver = direction_resolver
+        self._reconciliation_window_s = max(0.0, float(reconciliation_window_s))
+        # Cross-camera recent-entry memory for reconciliation, shared with the
+        # sibling pipeline by the composition root. A private instance (the
+        # default) is never consulted in single-camera mode.
+        self._recent_entries = recent_entry_registry or RecentEntryRegistry()
 
         self._target_fps = _clamp(float(target_fps), MIN_TARGET_FPS, MAX_TARGET_FPS)
         self._frame_interval_s = 1.0 / self._target_fps
@@ -319,6 +393,11 @@ class DetectionPipeline:
             track_staleness_frames=_cfg(
                 config, "pipeline.track_staleness_frames", DEFAULT_STALENESS_FRAMES
             ),
+            reconciliation_window_s=_cfg(
+                config,
+                "direction.reconciliation_window_s",
+                DEFAULT_RECONCILIATION_WINDOW_S,
+            ),
             **overrides,
         )
 
@@ -359,6 +438,11 @@ class DetectionPipeline:
     def is_running(self) -> bool:
         """Whether the ingest loop is currently running."""
         return self._running
+
+    @property
+    def source(self) -> VideoSource:
+        """The video source this pipeline ingests from."""
+        return self._source
 
     def latest_feed(self) -> Optional[tuple[Any, list]]:
         """Return the most recent ``(frame, detections)`` for the live feed.
@@ -617,6 +701,7 @@ class DetectionPipeline:
             box=detection.box,
             detection_confidence=detection.confidence,
             track_id=track_id,
+            camera_id=self._camera_id,
         )
 
         # Req 3.1: crop exactly one region for this box and pass it to the OCR
@@ -655,15 +740,73 @@ class DetectionPipeline:
             reason = normalization.reason or REVIEW_FORMAT_INVALID
             return self._surface(event, acquired_at, reason)
 
-        # Req 5.1 / 7.2-7.4: a confident, format-valid reading is routed
-        # directly through the access controller's match-and-log; direction
-        # resolution is retired in the monitoring migration.
+        # A confident, format-valid reading is routed through the access
+        # controller's match-and-log. In dual-camera mode the direction is
+        # resolved from this pipeline's camera id and passed to the controller;
+        # in single-camera mode no resolver is wired and direction stays None
+        # (the controller keeps its flat behavior).
         self._finalize_latency(event, acquired_at)
-        decision = self._access.handle_detection(event)
+        direction = self._resolve_direction()
+        event.direction = direction
+
+        # Dual-detection reconciliation (Req 6.2, 6.3): an OUTBOUND read of a
+        # plate that just entered within the reconciliation window is the same
+        # physical pass seen by both cameras, not a real exit. Suppress the
+        # auto-exit for it and surface nothing; the inbound side already handled
+        # the pass.
+        if direction is DirectionOutcome.OUTBOUND and self._recent_entries.entered_within(
+            event.normalized_plate or "", acquired_at, self._reconciliation_window_s
+        ):
+            logger.info(
+                "Suppressing same-pass OUTBOUND read for plate %r within the "
+                "%.1fs reconciliation window.",
+                event.normalized_plate,
+                self._reconciliation_window_s,
+            )
+            if track_id is not None:
+                # Resolve the track so the receding car is not re-processed.
+                self._tracks.mark_resolved(track_id)
+            self._emit(event)
+            return event
+
+        # Single-camera mode (direction is None) calls with the original
+        # one-argument signature so existing collaborators/fakes are unaffected;
+        # dual-camera mode passes the resolved direction.
+        if direction is None:
+            decision = self._access.handle_detection(event)
+        else:
+            decision = self._access.handle_detection(event, direction)
+
+        # Record an authorized INBOUND entry so the outbound camera can
+        # reconcile a same-pass double glimpse (Req 6.3).
+        if (
+            direction is DirectionOutcome.INBOUND
+            and decision.classification is Classification.RESIDENT
+        ):
+            self._recent_entries.record_entry(
+                event.normalized_plate or "", acquired_at
+            )
+
         self._apply_decision(event, decision)
         self._apply_track_outcome(track_id, event, decision)
         self._emit(event)
         return event
+
+    def _resolve_direction(self) -> Optional[DirectionOutcome]:
+        """Resolve this pipeline's travel direction from its camera id.
+
+        Returns ``None`` in single-camera mode (no resolver wired), so the
+        access controller keeps its flat behavior. In dual-camera mode the
+        :class:`DualCameraResolver` maps this pipeline's ``camera_id`` to a
+        :class:`DirectionOutcome` (INBOUND / OUTBOUND / UNDETERMINED).
+        """
+        resolver = self._direction_resolver
+        if resolver is None:
+            return None
+        resolve_for_camera = getattr(resolver, "resolve_for_camera", None)
+        if callable(resolve_for_camera):
+            return resolve_for_camera(self._camera_id)
+        return None
 
     def _apply_track_outcome(
         self, track_id: Optional[int], event: DetectionEvent, decision: Any
@@ -760,6 +903,10 @@ class DetectionPipeline:
         here as before.
         """
         event.classification = decision.classification
+        # Carry the Exit_Anomaly marker onto the event so the Guard_Dashboard can
+        # label it distinctly and record a permit as an EXIT (Req 5.3, 5.4),
+        # regardless of which surfacing path runs below.
+        event.is_exit_anomaly = bool(getattr(decision, "is_exit_anomaly", False))
         if not getattr(decision, "surfaced_to_guard", False):
             return
 

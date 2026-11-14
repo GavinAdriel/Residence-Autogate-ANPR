@@ -135,9 +135,13 @@ def test_resident_repository_exposes_only_find_by_plate() -> None:
 
 
 @pytest.mark.smoke
-def test_event_log_repository_exposes_only_append() -> None:
-    """The event-log port is append-only: only ``append`` (Req 4.7)."""
+def test_event_log_repository_exposes_append_and_exit_correlation() -> None:
+    """The event-log port is append + exit correlation.
+
+    Supersedes the earlier append-only expectation: the
+    dual-camera-exit-correlation feature revives entry/exit correlation, so the
+    port now also exposes ``find_open_entry`` and ``close_entry`` for the
+    OUTBOUND exit path (Req 5). It still carries no whitelist-mutation surface.
+    """
     members = _public_members(interfaces.EventLogRepository)
-    assert members == {"append"}, members
-    for retired in ("find_open_entries", "close_open_entry"):
-        assert not hasattr(interfaces.EventLogRepository, retired), retired
+    assert members == {"append", "find_open_entry", "close_entry"}, members

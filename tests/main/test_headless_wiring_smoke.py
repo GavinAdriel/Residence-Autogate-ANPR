@@ -76,7 +76,9 @@ class _RecordingDatabase(Database):
 
     instances: "list[_RecordingDatabase]" = []
 
-    def __init__(self, host, port, name, user, password, connect_factory=None):
+    def __init__(
+        self, host, port, name, user, password, ssl_ca=None, connect_factory=None
+    ):
         # Intentionally do not call super().__init__ (which would connect).
         self.connect_params = {
             "host": host,

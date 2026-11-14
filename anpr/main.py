@@ -43,7 +43,8 @@ used elsewhere in the codebase.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from anpr.config.provider import ConfigProvider
@@ -75,9 +76,19 @@ from anpr.ocr.engine import PaddleOcrEngine
 from anpr.persistence.db import Database, MissingTableError
 from anpr.persistence.event_log_repo import MySqlEventLogRepository
 from anpr.persistence.resident_repo import MySqlResidentRepository
-from anpr.pipeline.pipeline import DetectionPipeline
+from anpr.direction.resolver import (
+    MODE_DUAL_CAMERA,
+    create_direction_resolver,
+)
+from anpr.pipeline.pipeline import (
+    DetectionPipeline,
+    RecentEntryRegistry,
+)
 from anpr.pipeline.track_aggregator import TrackAggregator
-from anpr.pipeline.video_source import IpCameraVideoSource, WebcamVideoSource
+from anpr.pipeline.video_source import (
+    IpCameraVideoSource,
+    WebcamVideoSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,17 +192,33 @@ def build_video_source(config: ConfigProvider) -> VideoSource:
     ``webcam`` -> :class:`WebcamVideoSource` addressed by ``camera.device_index``;
     ``ip`` -> :class:`IpCameraVideoSource` addressed by ``camera.stream_url``.
     """
-    camera_type = _cfg(config, "camera.type", CAMERA_WEBCAM)
+    return _build_source_from(config, "camera")
+
+
+def _build_source_from(config: ConfigProvider, prefix: str) -> VideoSource:
+    """Build a video source from a camera config sub-tree rooted at ``prefix``.
+
+    Reads ``{prefix}.type`` and the matching address key, so the same selection
+    logic serves the single top-level ``camera.*`` block and each per-camera
+    block under ``direction.cameras.*`` in dual-camera mode (Req 1.1).
+    """
+    camera_type = _cfg(config, f"{prefix}.type", CAMERA_WEBCAM)
     if camera_type == CAMERA_WEBCAM:
-        device_index = int(_cfg(config, "camera.device_index", 0))
-        logger.info("Selecting WebcamVideoSource (device_index=%d).", device_index)
+        device_index = int(_cfg(config, f"{prefix}.device_index", 0))
+        logger.info(
+            "Selecting WebcamVideoSource for %s (device_index=%d).",
+            prefix,
+            device_index,
+        )
         return WebcamVideoSource(device_index)
     if camera_type == CAMERA_IP:
-        stream_url = str(_cfg(config, "camera.stream_url", ""))
-        logger.info("Selecting IpCameraVideoSource (stream_url=%r).", stream_url)
+        stream_url = str(_cfg(config, f"{prefix}.stream_url", ""))
+        logger.info(
+            "Selecting IpCameraVideoSource for %s (stream_url=%r).", prefix, stream_url
+        )
         return IpCameraVideoSource(stream_url)
     raise StartupError(
-        f"Unsupported camera.type {camera_type!r}; expected "
+        f"Unsupported {prefix}.type {camera_type!r}; expected "
         f"{CAMERA_WEBCAM!r} or {CAMERA_IP!r}."
     )
 
@@ -313,6 +340,13 @@ def build_ocr_engine(config: ConfigProvider) -> OcrEngine:
     return PaddleOcrEngine()
 
 
+def _build_loaded_detector(config: ConfigProvider) -> YoloVehicleDetector:
+    """Build and load an extra detector instance (one per additional camera)."""
+    extra = build_detector(config)
+    load_detector_weights_or_halt(extra)
+    return extra
+
+
 def load_detector_weights_or_halt(detector: YoloVehicleDetector) -> None:
     """Load detector weights before the first frame, halting on failure.
 
@@ -398,6 +432,151 @@ def build_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Camera pipelines (single- or dual-camera, selected from direction.mode)
+# ---------------------------------------------------------------------------
+@dataclass
+class CameraPipeline:
+    """One camera's fully-wired pipeline plus the state the GUI needs to wire it.
+
+    Bundles the per-camera id, its own :class:`TrackAggregator` (so two cameras'
+    tracker id spaces never collide, Req 6.1), a human-readable label, and
+    whether this is the primary feed to render in the single live-view pane.
+    """
+
+    camera_id: Optional[int]
+    label: str
+    pipeline: DetectionPipeline
+    track_aggregator: TrackAggregator
+    is_primary: bool = False
+    # Shared recent-entry memory (dual-camera only). The guard dashboard records a
+    # permitted guest entry here so the outbound camera's same-pass glimpse is
+    # reconciled for guests exactly as it is for residents.
+    recent_entries: Optional[RecentEntryRegistry] = None
+
+
+def build_camera_pipelines(
+    config: ConfigProvider,
+    detector: YoloVehicleDetector,
+    ocr_engine: OcrEngine,
+    normalizer: PlateNormalizer,
+    access_controller: AccessController,
+    *,
+    on_event: Optional[Callable[[Any], None]] = None,
+    on_manual_review: Optional[Callable[[Any], None]] = None,
+    detector_factory: Optional[Callable[[], Any]] = None,
+) -> list[CameraPipeline]:
+    """Build the camera pipeline(s), selected purely from ``direction.mode``.
+
+    * ``single_camera_trajectory`` (default) -> exactly one pipeline over the
+      top-level ``camera.*`` source, preserving the existing single-camera
+      behavior (Req 7.1).
+    * ``dual_camera`` -> two pipelines, one per camera under
+      ``direction.cameras.{inbound,outbound}``, sharing the detector, OCR,
+      normalizer, gate, repositories, and image store, plus a shared
+      :class:`DualCameraResolver` (direction by camera) and a shared
+      :class:`RecentEntryRegistry` (same-pass reconciliation). Each pipeline has
+      its OWN :class:`TrackAggregator` so identical tracker ids never collide
+      (Req 6.1).
+
+    ``detector_factory`` (optional) builds an additional, already-loaded detector.
+    In dual-camera mode the first (inbound) pipeline uses ``detector`` and each
+    further pipeline gets its own instance from the factory, so every camera has
+    its own model and tracker state. A shared ``track(persist=True)`` model would
+    interleave both cameras' frames in one tracker (mixing track ids) and race on
+    its lazy first-call setup across the pipeline threads.
+    """
+    mode = _cfg(config, "direction.mode", "single_camera_trajectory")
+
+    if mode != MODE_DUAL_CAMERA:
+        # Single-camera: one pipeline over the top-level camera source. Direction
+        # stays None so the access controller keeps its flat behavior (Req 7.1).
+        source = build_video_source(config)
+        aggregator = TrackAggregator(
+            staleness_frames=int(_cfg(config, "pipeline.track_staleness_frames", 1))
+        )
+        pipeline = build_pipeline(
+            config,
+            source,
+            detector,
+            ocr_engine,
+            normalizer,
+            access_controller,
+            track_aggregator=aggregator,
+            on_event=on_event,
+            on_manual_review=on_manual_review,
+        )
+        return [
+            CameraPipeline(
+                camera_id=resolve_camera_id(config),
+                label="camera",
+                pipeline=pipeline,
+                track_aggregator=aggregator,
+                is_primary=True,
+            )
+        ]
+
+    # Dual-camera: build the shared resolver + reconciliation registry once.
+    # Each pipeline reads its own reconciliation window from config via
+    # ``from_config``.
+    resolver = create_direction_resolver(config)
+    registry = RecentEntryRegistry()
+    staleness = int(_cfg(config, "pipeline.track_staleness_frames", 1))
+
+    pipelines: list[CameraPipeline] = []
+    for side, is_primary in (("inbound", True), ("outbound", False)):
+        prefix = f"direction.cameras.{side}"
+        camera_id = _resolve_side_camera_id(config, side)
+        source = _build_source_from(config, prefix)
+        aggregator = TrackAggregator(staleness_frames=staleness)
+        side_detector = (
+            detector if (is_primary or detector_factory is None) else detector_factory()
+        )
+        # ``from_config`` reads ``direction.reconciliation_window_s`` itself, so
+        # it is not passed here (passing it too would duplicate the keyword).
+        pipeline = DetectionPipeline.from_config(
+            config,
+            source,
+            side_detector,
+            ocr_engine,
+            normalizer,
+            access_controller,
+            track_aggregator=aggregator,
+            camera_id=camera_id,
+            direction_resolver=resolver,
+            recent_entry_registry=registry,
+            on_event=on_event,
+            on_manual_review=on_manual_review,
+        )
+        logger.info(
+            "Built %s camera pipeline (camera_id=%s).", side, camera_id
+        )
+        pipelines.append(
+            CameraPipeline(
+                camera_id=camera_id,
+                label=side,
+                pipeline=pipeline,
+                track_aggregator=aggregator,
+                is_primary=is_primary,
+                recent_entries=registry,
+            )
+        )
+    return pipelines
+
+
+def _resolve_side_camera_id(config: ConfigProvider, side: str) -> Optional[int]:
+    """Resolve ``direction.cameras.{side}.id`` to an int Camera_ID (or None)."""
+    raw = _cfg(config, f"direction.cameras.{side}.id", None)
+    if raw is None:
+        logger.warning("direction.cameras.%s.id is not configured.", side)
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.error("Invalid direction.cameras.%s.id %r; expected integer.", side, raw)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Application assembly (non-GUI; headless-testable)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -423,6 +602,10 @@ class Application:
     access_controller: AccessController
     track_aggregator: TrackAggregator
     pipeline: DetectionPipeline
+    # All camera pipelines (one in single-camera mode, two in dual-camera mode).
+    # ``pipeline``/``track_aggregator``/``video_source`` above mirror the primary
+    # pipeline so existing single-camera callers and tests are unaffected.
+    camera_pipelines: list["CameraPipeline"] = field(default_factory=list)
 
 
 def build_application(
@@ -460,10 +643,11 @@ def build_application(
     image_store = build_image_store(config, database)
 
     # Step 4-5: concrete selection purely from config (Req 14.2, 14.4).
-    video_source = build_video_source(config)
     gate = build_gate(config, hardware_interface=hardware_interface)
 
-    # Pure collaborators.
+    # Pure collaborators. In dual-camera mode the controller's single
+    # ``camera_id`` is a fallback only; each detection carries its own camera id
+    # (stamped by its pipeline), which the controller prefers when writing.
     normalizer = PlateNormalizer()
     ocr_engine = build_ocr_engine(config)
     access_controller = build_access_controller(
@@ -475,30 +659,25 @@ def build_application(
         image_store=image_store,
     )
 
-    # Step 6: load detector weights BEFORE constructing/starting the pipeline
+    # Step 6: load detector weights BEFORE constructing/starting any pipeline
     # so the first frame is never processed against unloaded weights (Req 2.1).
     detector = build_detector(config)
     if load_weights:
         load_detector_weights_or_halt(detector)
 
-    # Step 7: assemble the pipeline over the abstractions. The per-track
-    # deduplication state is created once here (the single owner) so it can be
-    # shared with the Guard_Dashboard for guard-permitted guest resolution.
-    track_aggregator = TrackAggregator(
-        staleness_frames=int(
-            _cfg(config, "pipeline.track_staleness_frames", 1)
-        )
-    )
-    pipeline = build_pipeline(
+    # Step 7: assemble the camera pipeline(s) over the abstractions, selected
+    # purely from ``direction.mode`` (one in single-camera, two in dual-camera).
+    camera_pipelines = build_camera_pipelines(
         config,
-        video_source,
         detector,
         ocr_engine,
         normalizer,
         access_controller,
-        track_aggregator=track_aggregator,
         on_event=on_event,
         on_manual_review=on_manual_review,
+    )
+    primary = next(
+        (cp for cp in camera_pipelines if cp.is_primary), camera_pipelines[0]
     )
 
     return Application(
@@ -508,14 +687,15 @@ def build_application(
         resident_repo=resident_repo,
         event_log_repo=event_log_repo,
         image_store=image_store,
-        video_source=video_source,
+        video_source=primary.pipeline.source,  # mirrors the primary camera
         gate=gate,
         normalizer=normalizer,
         detector=detector,
         ocr_engine=ocr_engine,
         access_controller=access_controller,
-        track_aggregator=track_aggregator,
-        pipeline=pipeline,
+        track_aggregator=primary.track_aggregator,
+        pipeline=primary.pipeline,
+        camera_pipelines=camera_pipelines,
     )
 
 
@@ -581,7 +761,6 @@ def main(
 
     database, resident_repo, event_log_repo = build_repositories(config)
     image_store = build_image_store(config, database)
-    video_source = build_video_source(config)
     gate = build_gate(config, hardware_interface=hardware_interface)
     normalizer = PlateNormalizer()
     ocr_engine = build_ocr_engine(config)
@@ -595,7 +774,7 @@ def main(
         image_store=image_store,
     )
 
-    # Load detector weights BEFORE the pipeline starts (Req 2.1, 2.5).
+    # Load detector weights BEFORE any pipeline starts (Req 2.1, 2.5).
     detector = build_detector(config)
     load_detector_weights_or_halt(detector)
 
@@ -615,28 +794,49 @@ def main(
 
     bridge = _EventBridge()
 
-    # Per-track deduplication state shared by the pipeline and the dashboard:
-    # the pipeline logs one event per vehicle and surfaces guests, and a
-    # guard-permitted guest marks its track resolved here so it is never
-    # re-surfaced or re-processed.
-    track_aggregator = TrackAggregator(
-        staleness_frames=int(_cfg(config, "pipeline.track_staleness_frames", 1))
-    )
-
-    # Assemble the pipeline with the bridge-backed callbacks (Req 12.2, 12.7).
-    # Built before the dashboards so its live-feed accessor can be wired into
-    # the Guard_Dashboard as the frame provider.
-    pipeline = build_pipeline(
+    # Assemble the camera pipeline(s) with the bridge-backed callbacks, selected
+    # from ``direction.mode`` (one pipeline in single-camera mode, two in
+    # dual-camera mode). Both cameras share the detector/OCR/gate/repos and emit
+    # onto the same bridge, so the Guard_Dashboard sees a unified event stream.
+    camera_pipelines = build_camera_pipelines(
         config,
-        video_source,
         detector,
         ocr_engine,
         normalizer,
         access_controller,
-        track_aggregator=track_aggregator,
         on_event=bridge.detection.emit,
         on_manual_review=bridge.review.emit,
+        detector_factory=lambda: _build_loaded_detector(config),
     )
+    primary = next(
+        (cp for cp in camera_pipelines if cp.is_primary), camera_pipelines[0]
+    )
+
+    # A guard-permitted guest marks its track resolved on the aggregator of the
+    # camera that surfaced it; resolve on whichever aggregator holds the track so
+    # dual-camera guests are not re-surfaced/re-processed.
+    def _resolve_track(track_id: int) -> None:
+        for cp in camera_pipelines:
+            if cp.track_aggregator.is_tracked(track_id):
+                cp.track_aggregator.mark_resolved(track_id)
+                return
+        # Unknown track (e.g. aged out): resolve on every aggregator so a late
+        # grant is never lost.
+        for cp in camera_pipelines:
+            cp.track_aggregator.mark_resolved(track_id)
+
+    # A guard-permitted INBOUND guest is remembered in the shared recent-entry
+    # registry (same-pass reconciliation, Req 6.2, 6.3), so the outbound camera's
+    # brief glimpse of the entering car is not treated as the guest's exit. Times
+    # are time.monotonic(), matching the pipelines' default clock.
+    recent_entries = next(
+        (cp.recent_entries for cp in camera_pipelines if cp.recent_entries is not None),
+        None,
+    )
+
+    def _record_guest_entry(normalized_plate: str) -> None:
+        if recent_entries is not None:
+            recent_entries.record_entry(normalized_plate, time.monotonic())
 
     guard_dashboard = GuardDashboard(
         gate,
@@ -646,10 +846,21 @@ def main(
         image_store=image_store,
         environment_label=environment_label,
         camera_id=camera_id,
-        frame_provider=pipeline.latest_feed,
-        # A guard-permitted guest marks its track resolved on the shared
-        # aggregator so the pipeline stops re-surfacing/re-processing it.
-        on_resolve_track=track_aggregator.mark_resolved,
+        # The primary pane renders the primary (inbound) camera feed; in
+        # dual-camera mode every other camera gets its own live pane.
+        frame_provider=primary.pipeline.latest_feed,
+        primary_feed_title=(
+            f"Live Feed - {primary.label.title()}"
+            if len(camera_pipelines) > 1
+            else "Live Feed"
+        ),
+        extra_feeds=[
+            (f"Live Feed - {cp.label.title()}", cp.pipeline.latest_feed)
+            for cp in camera_pipelines
+            if cp is not primary
+        ],
+        on_resolve_track=_resolve_track,
+        on_guest_entry=_record_guest_entry,
     )
 
     bridge.detection.connect(guard_dashboard.on_detection)
@@ -661,22 +872,34 @@ def main(
 
     guard_dashboard.show()
 
-    # Start polling the pipeline's latest frame so the live feed renders
+    # Start polling the primary pipeline's latest frame so the live feed renders
     # continuously at >= the configured min fps (Req 12.1).
     guard_dashboard.start_feed()
 
-    # Run the blocking ingest loop on a background daemon thread so the Qt event
-    # loop stays responsive; stop it cleanly when the app quits.
-    pipeline_thread = threading.Thread(
-        target=pipeline.start, name="detection-pipeline", daemon=True
-    )
-    app.aboutToQuit.connect(pipeline.stop)
-    pipeline_thread.start()
+    # Run each pipeline's blocking ingest loop on its own background daemon
+    # thread so the Qt event loop stays responsive and the two cameras ingest
+    # independently; stop them all cleanly when the app quits.
+    pipeline_threads: list[threading.Thread] = []
+    for cp in camera_pipelines:
+        thread = threading.Thread(
+            target=cp.pipeline.start,
+            name=f"detection-pipeline-{cp.label}",
+            daemon=True,
+        )
+        app.aboutToQuit.connect(cp.pipeline.stop)
+        thread.start()
+        pipeline_threads.append(thread)
 
-    logger.info("ANPR Autogate System started; entering Qt event loop.")
+    logger.info(
+        "ANPR Autogate System started with %d camera pipeline(s); entering Qt "
+        "event loop.",
+        len(camera_pipelines),
+    )
     exit_code = app.exec_()
-    pipeline.stop()
-    pipeline_thread.join(timeout=5.0)
+    for cp in camera_pipelines:
+        cp.pipeline.stop()
+    for thread in pipeline_threads:
+        thread.join(timeout=5.0)
     return exit_code
 
 

@@ -31,8 +31,23 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from anpr.core.models import EventRecord
+from anpr.core.models import (
+    Classification,
+    DirectionOutcome,
+    EntryState,
+    EventKind,
+    EventRecord,
+    GrantMethod,
+)
 from anpr.persistence.db import Database
+
+# Columns read back for an Open_Entry_Record lookup (exit correlation, Req 5.1).
+# Aliased to the EventRecord field names the row mapper expects.
+_SELECT_COLUMNS = (
+    "Log_ID, Inserted_Time, Camera_ID, License_Plate_Number, Normalized_Plate, "
+    "Guard_Plate, Vehicle_ID, Classification, Direction, Event_Kind, "
+    "Grant_Method, Entry_State, Image_Ref, Closed_By_Log_ID"
+)
 
 # Columns inserted for every record, in ``ANPR_Log`` schema naming.
 #
@@ -50,7 +65,12 @@ _PLACEHOLDERS = ", ".join(["%s"] * len(_COLUMNS.split(",")))
 
 
 class MySqlEventLogRepository:
-    """Append-only access to the ``ANPR_Log`` table backed by MySQL.
+    """Append + entry/exit correlation access to ``ANPR_Log`` backed by MySQL.
+
+    Besides the base ``append`` write, the dual-camera exit feature adds
+    :meth:`find_open_entry` and :meth:`close_entry` for OUTBOUND exit
+    correlation (dual-camera-exit-correlation Req 5). Single-camera / flat-log
+    deployments use only ``append``.
 
     Parameters
     ----------
@@ -106,6 +126,97 @@ class MySqlEventLogRepository:
         )
         record.log_id = log_id
         return log_id
+
+    # ------------------------------------------------------------------
+    # Entry/exit correlation (dual-camera exit, Req 5)
+    # ------------------------------------------------------------------
+    def find_open_entry(self, normalized_plate: str) -> Optional[EventRecord]:
+        """Return the most recent OPEN entry for ``normalized_plate``, or None.
+
+        Selects the Open_Entry_Record (``Event_Kind = 'ENTRY'`` AND
+        ``Entry_State = 'OPEN'``) for the plate, newest first, so an exiting
+        guest is correlated to its latest unclosed entry (Req 5.1). Uses the
+        ``idx_log_open_entries (Normalized_Plate, Entry_State, Event_Kind)``
+        index (Req 5.5). The empty string returns ``None`` without querying.
+        Returns ``None`` when no open entry exists (an Exit_Anomaly, Req 5.3).
+        """
+        if not normalized_plate:
+            return None
+        rows = self._db.query(
+            f"SELECT {_SELECT_COLUMNS} FROM ANPR_Log "
+            "WHERE Normalized_Plate = %s AND Event_Kind = %s AND Entry_State = %s "
+            "ORDER BY Inserted_Time DESC, Log_ID DESC LIMIT 1",
+            (normalized_plate, EventKind.ENTRY.value, EntryState.OPEN.value),
+        )
+        return _row_to_record(rows[0]) if rows else None
+
+    def close_entry(self, entry_log_id: int, closed_by_log_id: int) -> int:
+        """Close an open entry; return the number of rows affected (Req 5.2).
+
+        Sets ``Entry_State = 'CLOSED'`` and ``Closed_By_Log_ID`` on the entry row
+        identified by ``entry_log_id``, guarded by ``Entry_State = 'OPEN'`` so a
+        second close affects zero rows rather than clobbering the first exit that
+        closed it (idempotent / race-safe, Req 5.6). The caller treats a zero
+        result as "already closed", never as an error.
+        """
+        return self._db.execute(
+            "UPDATE ANPR_Log SET Entry_State = %s, Closed_By_Log_ID = %s "
+            "WHERE Log_ID = %s AND Entry_State = %s",
+            (
+                EntryState.CLOSED.value,
+                int(closed_by_log_id),
+                int(entry_log_id),
+                EntryState.OPEN.value,
+            ),
+        )
+
+
+# ----------------------------------------------------------------------
+# Deserialization (row -> EventRecord) for exit correlation
+# ----------------------------------------------------------------------
+def _enum_or_none(enum_cls, value):
+    """Map a DB string back to an enum member, or ``None`` when absent/unknown."""
+    if value is None:
+        return None
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return None
+
+
+def _row_to_record(row: dict) -> EventRecord:
+    """Map an ``ANPR_Log`` DictCursor row onto an :class:`EventRecord`.
+
+    Only the fields needed for exit correlation are reconstructed (identity,
+    plate, direction/kind/state, camera/vehicle, and ``Log_ID``); numeric
+    metrics are left at their defaults since the open-entry lookup does not use
+    them. ``Inserted_Time`` is rendered as ISO-8601 text to match the dataclass.
+    """
+    inserted = row.get("Inserted_Time")
+    isoformat = getattr(inserted, "isoformat", None)
+    timestamp = isoformat() if callable(isoformat) else (str(inserted) if inserted else "")
+    return EventRecord(
+        id=str(row.get("Log_ID") or ""),
+        timestamp=timestamp,
+        ocr_plate=row.get("License_Plate_Number") or "",
+        guard_plate=row.get("Guard_Plate") or "",
+        normalized_plate=row.get("Normalized_Plate") or "",
+        classification=_enum_or_none(Classification, row.get("Classification")),
+        direction=_enum_or_none(DirectionOutcome, row.get("Direction")),
+        grant_method=_enum_or_none(GrantMethod, row.get("Grant_Method"))
+        or GrantMethod.NONE,
+        event_kind=_enum_or_none(EventKind, row.get("Event_Kind")),
+        entry_state=_enum_or_none(EntryState, row.get("Entry_State")) or EntryState.NA,
+        closed_by_event_id=(
+            str(row["Closed_By_Log_ID"])
+            if row.get("Closed_By_Log_ID") is not None
+            else None
+        ),
+        image_ref=row.get("Image_Ref"),
+        camera_id=(int(row["Camera_ID"]) if row.get("Camera_ID") is not None else None),
+        vehicle_id=(int(row["Vehicle_ID"]) if row.get("Vehicle_ID") is not None else None),
+        log_id=(int(row["Log_ID"]) if row.get("Log_ID") is not None else None),
+    )
 
 
 # ----------------------------------------------------------------------

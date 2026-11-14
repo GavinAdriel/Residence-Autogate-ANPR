@@ -53,7 +53,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from anpr.core.interfaces import (
     ConfigProvider,
@@ -66,6 +66,7 @@ from anpr.core.models import (
     NA_SENTINEL,
     Classification,
     DetectionEvent,
+    DirectionOutcome,
     EntryState,
     EnvironmentLabel,
     EventKind,
@@ -327,6 +328,9 @@ class ManualGrantService:
         frame: Optional[Frame] = None,
         event_id: Optional[str] = None,
         classification: Optional[Classification] = None,
+        is_exit: bool = False,
+        direction: Optional[DirectionOutcome] = None,
+        camera_id: Optional[int] = None,
     ) -> ManualGrantResult:
         """Request the gate-open and, on success, record the manual grant.
 
@@ -369,6 +373,28 @@ class ManualGrantService:
         # once a Log_ID exists for its NOT NULL foreign key.
         captured = self._maybe_capture(frame, eid)
 
+        # A guard-permitted Exit_Anomaly is recorded as an OUTBOUND EXIT row
+        # (still Grant_Method=MANUAL); any other manual grant stays a plain
+        # MANUAL event with no direction (dual-camera-exit-correlation Req 5.4).
+        # A guard-permitted INBOUND guest (dual-camera mode, where the detection
+        # carries a direction) is the guest's entry ticket: it is written as an
+        # ENTRY/OPEN row so a later OUTBOUND read can correlate to it and
+        # auto-authorize the exit (Req 4.1, 5.1). Without a direction (single
+        # camera) or for a bare manual open it stays a plain MANUAL event.
+        entry_state = EntryState.NA
+        if is_exit:
+            direction = DirectionOutcome.OUTBOUND
+            event_kind = EventKind.EXIT
+        elif (
+            classification is Classification.GUEST
+            and direction is DirectionOutcome.INBOUND
+        ):
+            event_kind = EventKind.ENTRY
+            entry_state = EntryState.OPEN
+        else:
+            direction = None
+            event_kind = EventKind.MANUAL
+
         record = EventRecord(
             id=eid,
             timestamp=self._clock_iso(),
@@ -376,12 +402,14 @@ class ManualGrantService:
             guard_plate=normalized_plate,
             normalized_plate=normalized_plate,
             classification=classification,
-            direction=None,
+            direction=direction,
             grant_method=GrantMethod.MANUAL,
-            event_kind=EventKind.MANUAL,
-            entry_state=EntryState.NA,
+            event_kind=event_kind,
+            entry_state=entry_state,
             image_ref=(captured.snapshot_path if captured is not None else None),
-            camera_id=self._camera_id,
+            # Prefer the camera that saw the vehicle (dual-camera mode) so an
+            # Exit_Anomaly permit is attributed to the outbound camera.
+            camera_id=(camera_id if camera_id is not None else self._camera_id),
             detection_confidence=NA_SENTINEL,
             ocr_confidence=NA_SENTINEL,
             processing_latency_ms=NA_SENTINEL,
@@ -499,9 +527,14 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         config: Optional[ConfigProvider] = None,
         image_store: Optional[ImageStore] = None,
         frame_provider: Optional[Callable[[], Optional[tuple[Frame, list]]]] = None,
+        primary_feed_title: str = "Live Feed",
+        extra_feeds: Optional[
+            Sequence[tuple[str, Callable[[], Optional[tuple[Frame, list]]]]]
+        ] = None,
         environment_label: Optional[EnvironmentLabel] = None,
         camera_id: Optional[int] = None,
         on_resolve_track: Optional[Callable[[int], None]] = None,
+        on_guest_entry: Optional[Callable[[str], None]] = None,
         parent: Optional[Any] = None,
     ) -> None:
         if not _PYQT5_AVAILABLE:  # pragma: no cover - exercised only pre-install
@@ -513,11 +546,20 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
 
         self._guard_config = GuardConfig.from_config(config)
         self._frame_provider = frame_provider
+        # Additional live-feed panes (e.g. the outbound camera in dual-camera
+        # mode): (title, provider) pairs rendered below the primary feed.
+        self._primary_feed_title = primary_feed_title
+        self._extra_feeds = list(extra_feeds or [])
+        self._extra_feed_labels: list[Any] = []
         # Invoked with a resolved guest's ``track_id`` when the guard permits it,
         # so the composition root can mark that track resolved on the shared
         # TrackAggregator -- the pipeline then stops re-surfacing/re-processing
         # the guest. ``None`` keeps the dashboard standalone (e.g. in tests).
         self._on_resolve_track = on_resolve_track
+        # Invoked with the normalized plate when a guard permit writes an INBOUND
+        # guest ENTRY ticket, so the composition root can record it for
+        # same-pass reconciliation with the outbound camera.
+        self._on_guest_entry = on_guest_entry
 
         # Pure collaborators (testable without a GUI).
         self._review_queue = ManualReviewQueue()
@@ -578,14 +620,30 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         root = QHBoxLayout(central)
 
         # --- Left panel: live feed with overlays (Req 12.1) ----------------
-        left_panel = QGroupBox("Live Feed", central)
+        feed_column = QVBoxLayout()
+        multi = bool(self._extra_feeds)
+        min_size = (400, 300) if multi else (480, 360)
+
+        left_panel = QGroupBox(self._primary_feed_title, central)
         left_layout = QVBoxLayout(left_panel)
         self._feed_label = QLabel("No feed", left_panel)
         self._feed_label.setAlignment(Qt.AlignCenter)
-        self._feed_label.setMinimumSize(480, 360)
+        self._feed_label.setMinimumSize(*min_size)
         self._feed_label.setScaledContents(False)
         left_layout.addWidget(self._feed_label)
-        root.addWidget(left_panel, 2)
+        feed_column.addWidget(left_panel, 1)
+
+        for title, _provider in self._extra_feeds:
+            extra_panel = QGroupBox(title, central)
+            extra_layout = QVBoxLayout(extra_panel)
+            extra_label = QLabel("No feed", extra_panel)
+            extra_label.setAlignment(Qt.AlignCenter)
+            extra_label.setMinimumSize(*min_size)
+            extra_label.setScaledContents(False)
+            extra_layout.addWidget(extra_label)
+            self._extra_feed_labels.append(extra_label)
+            feed_column.addWidget(extra_panel, 1)
+        root.addLayout(feed_column, 2)
 
         # --- Right column: split into top-right and bottom-right -----------
         right_column = QVBoxLayout()
@@ -654,6 +712,27 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
 
     def _refresh_feed(self) -> None:
         """Timer slot: pull the latest frame + detections and render them."""
+        # Extra feeds first: they render only and never touch the frame retained
+        # for manual-grant capture.
+        for (title, provider), label in zip(self._extra_feeds, self._extra_feed_labels):
+            try:
+                extra_payload = provider()
+            except Exception as exc:  # noqa: BLE001 - must not crash the UI
+                logger.error("Live-feed provider for %r failed: %s", title, exc)
+                continue
+            if extra_payload is None:
+                continue
+            extra_frame, extra_detections = extra_payload
+            if extra_frame is None:
+                continue
+            pixmap = self._frame_to_pixmap(extra_frame, list(extra_detections or []))
+            if pixmap is not None:
+                label.setPixmap(
+                    pixmap.scaled(
+                        label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                )
+
         if self._frame_provider is None:
             return
         try:
@@ -922,11 +1001,16 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         classification = (
             Classification.GUEST if guest_event is not None else None
         )
+        # A guard-permitted Exit_Anomaly records an OUTBOUND EXIT row (Req 5.4).
+        is_exit = bool(getattr(guest_event, "is_exit_anomaly", False))
 
         result = self._grant_service.record_manual_grant(
             plate_text or None,
             frame=self._current_frame,
             classification=classification,
+            is_exit=is_exit,
+            direction=getattr(guest_event, "direction", None),
+            camera_id=getattr(guest_event, "camera_id", None),
         )
         self.last_grant_result = result
 
@@ -939,6 +1023,17 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
             granted_plate = result.record.normalized_plate if result.record else ""
             suffix = f" (plate {granted_plate})" if granted_plate else ""
             self._status_label.setText(f"Gate opened; manual grant recorded{suffix}.")
+            record = result.record
+            if (
+                self._on_guest_entry is not None
+                and record is not None
+                and record.event_kind is EventKind.ENTRY
+                and record.normalized_plate
+            ):
+                try:
+                    self._on_guest_entry(record.normalized_plate)
+                except Exception:  # noqa: BLE001 - a callback fault must not crash the UI
+                    logger.error("on_guest_entry callback failed.", exc_info=True)
             # One row written for this guest: resolve its track so the pipeline
             # stops re-surfacing/re-processing it, drop any queue entry, and
             # clear the input so the next guest starts clean (decision 2a). The
@@ -1012,7 +1107,16 @@ def _format_timestamp(timestamp: Optional[datetime]) -> str:
 
 
 def _review_label(event: DetectionEvent, reason: Optional[str]) -> str:
-    """Build a concise one-line label for a manual-review queue entry."""
+    """Build a concise one-line label for a manual-review queue entry.
+
+    An Exit_Anomaly -- a vehicle leaving with no matching entry ticket -- is
+    prefixed with a distinct ``[EXIT - NO TICKET]`` tag so the guard immediately
+    sees it differs from a normal guest entry (dual-camera-exit-correlation
+    Req 5.3).
+    """
     plate = event.normalized_plate or event.ocr_text or "(no plate)"
     text = reason if reason is not None else getattr(event, "manual_review_reason", None)
-    return f"{plate} - {text}" if text else str(plate)
+    base = f"{plate} - {text}" if text else str(plate)
+    if getattr(event, "is_exit_anomaly", False):
+        return f"[EXIT - NO TICKET] {base}"
+    return base

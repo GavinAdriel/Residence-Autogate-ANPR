@@ -210,37 +210,67 @@ class SingleCameraTrajectoryResolver:
 
 
 class DualCameraResolver:
-    """Dual-camera direction resolver (``dual_camera``) — deferred this phase.
+    """Dual-camera direction resolver (``dual_camera``).
 
-    In the eventual field deployment this resolver derives inbound/outbound
-    direction from the identity of the camera feed that produced the detection,
-    using a camera-feed-to-direction mapping supplied by configuration
-    (Req 7.6), and resolves an unknown feed to UNDETERMINED for manual
-    resolution (Req 7.7).
+    Direction is derived from the identity of the camera feed that produced the
+    detection, not from motion trajectory: the Inbound_Camera resolves to
+    ``INBOUND`` and the Outbound_Camera to ``OUTBOUND``
+    (dual-camera-exit-correlation Req 2.1, 2.2). A camera id not present in the
+    configured mapping resolves to ``UNDETERMINED`` so the event is surfaced to
+    the guard rather than acted on automatically (Req 2.3).
 
-    The resolution logic is *not implemented in this phase*. The class and its
-    ``resolve`` method are retained so the ``DirectionResolver`` interface
-    surface and the ``direction.mode = dual_camera`` configuration option stay
-    present and selectable for the field-deployment target.
+    The mapping is keyed by ``Camera.Camera_ID`` (the integer id stamped onto
+    each detection and written to ``ANPR_Log.Camera_ID``), with values being
+    ``DirectionOutcome`` members. ``create_direction_resolver`` builds it from
+    the two configured camera ids.
+
+    This class provides :meth:`resolve_for_camera` -- the direct id->direction
+    lookup the pipeline uses, since the pipeline knows its own camera id -- and
+    also satisfies the trajectory-shaped ``DirectionResolver`` Protocol via
+    :meth:`resolve`, which delegates using ``track.camera_id``.
     """
 
-    def __init__(self, camera_direction_map: dict[str, str] | None = None) -> None:
-        # The mapping is retained so the deferred implementation can consume it
-        # unchanged; it is not used for resolution in this phase.
-        self._camera_direction_map = dict(camera_direction_map or {})
+    def __init__(
+        self, camera_direction_map: dict[int, DirectionOutcome] | None = None
+    ) -> None:
+        # Normalize keys to int (camera ids) and values to DirectionOutcome so
+        # the map is tolerant of config-sourced strings.
+        self._camera_direction_map: dict[int, DirectionOutcome] = {}
+        for key, value in dict(camera_direction_map or {}).items():
+            try:
+                cam_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            self._camera_direction_map[cam_id] = _as_direction(value)
 
     @property
-    def camera_direction_map(self) -> dict[str, str]:
-        """The retained camera-feed-to-direction mapping (unused this phase)."""
+    def camera_direction_map(self) -> dict[int, DirectionOutcome]:
+        """The camera-id -> direction mapping used for resolution."""
         return dict(self._camera_direction_map)
 
+    def resolve_for_camera(self, camera_id: "int | None") -> DirectionOutcome:
+        """Resolve direction from the producing camera's id (Req 2.1-2.3).
+
+        An id mapped to inbound yields ``INBOUND``, to outbound ``OUTBOUND``; an
+        unmapped or missing id yields ``UNDETERMINED`` so the event is surfaced
+        to the guard.
+        """
+        if camera_id is None:
+            return DirectionOutcome.UNDETERMINED
+        try:
+            cam_id = int(camera_id)
+        except (TypeError, ValueError):
+            return DirectionOutcome.UNDETERMINED
+        return self._camera_direction_map.get(cam_id, DirectionOutcome.UNDETERMINED)
+
     def resolve(self, track: TrackHistory) -> DirectionOutcome:
-        """Deferred: dual-camera resolution is not implemented in this phase."""
-        raise NotImplementedError(
-            "Dual-camera direction resolution is deferred in this phase; "
-            "the interface and configuration option are retained for the "
-            "eventual field deployment."
-        )
+        """Resolve using the track's ``camera_id`` (Protocol compatibility).
+
+        Delegates to :meth:`resolve_for_camera`. In practice the pipeline calls
+        :meth:`resolve_for_camera` directly with its own camera id; this method
+        keeps the ``DirectionResolver`` Protocol satisfied.
+        """
+        return self.resolve_for_camera(getattr(track, "camera_id", None))
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +294,22 @@ def _as_orientation(value) -> tuple[float, float]:
         return (float(x), float(y))
     except (TypeError, ValueError):
         return DEFAULT_INBOUND_REFERENCE_ORIENTATION
+
+
+def _as_direction(value) -> DirectionOutcome:
+    """Coerce a configured value into a :class:`DirectionOutcome`.
+
+    Accepts a ``DirectionOutcome`` member or its string value
+    (case-insensitive); anything unrecognized becomes ``UNDETERMINED`` so a
+    misconfigured mapping fails safe to manual resolution rather than silently
+    picking a direction.
+    """
+    if isinstance(value, DirectionOutcome):
+        return value
+    try:
+        return DirectionOutcome(str(value).strip().upper())
+    except (TypeError, ValueError, AttributeError):
+        return DirectionOutcome.UNDETERMINED
 
 
 def create_direction_resolver(config: ConfigProvider) -> DirectionResolver:
@@ -301,10 +347,42 @@ def create_direction_resolver(config: ConfigProvider) -> DirectionResolver:
 
     if mode == MODE_DUAL_CAMERA:
         return DualCameraResolver(
-            camera_direction_map=dict(_get(config, "direction.camera_direction_map", {}) or {})
+            camera_direction_map=_build_camera_direction_map(config)
         )
 
     raise ValueError(
         f"Unsupported direction.mode '{mode}'; expected one of "
         f"'{MODE_SINGLE_CAMERA_TRAJECTORY}' or '{MODE_DUAL_CAMERA}'."
     )
+
+
+def _build_camera_direction_map(config: ConfigProvider) -> dict[int, DirectionOutcome]:
+    """Build the camera-id -> direction map from the two configured cameras.
+
+    Reads ``direction.cameras.inbound.id`` -> INBOUND and
+    ``direction.cameras.outbound.id`` -> OUTBOUND. An explicit
+    ``direction.camera_direction_map`` (ids -> direction strings), when present,
+    is merged on top so an advanced configuration can override or extend the
+    mapping. Non-integer ids are skipped (and are caught by config validation
+    in dual mode).
+    """
+    mapping: dict[int, DirectionOutcome] = {}
+
+    def _put(cam_id, direction: DirectionOutcome) -> None:
+        if cam_id is None:
+            return
+        try:
+            mapping[int(cam_id)] = direction
+        except (TypeError, ValueError):
+            pass
+
+    _put(_get(config, "direction.cameras.inbound.id", None), DirectionOutcome.INBOUND)
+    _put(_get(config, "direction.cameras.outbound.id", None), DirectionOutcome.OUTBOUND)
+
+    for key, value in dict(_get(config, "direction.camera_direction_map", {}) or {}).items():
+        try:
+            mapping[int(key)] = _as_direction(value)
+        except (TypeError, ValueError):
+            continue
+
+    return mapping

@@ -135,12 +135,14 @@ class ResidentRepository(Protocol):
 
 @runtime_checkable
 class EventLogRepository(Protocol):
-    """Append-only access to the Event_Log.
+    """Append + entry/exit correlation access to the Event_Log.
 
-    Entry/exit correlation is retired in the monitoring migration (Req 5.2), so
-    the port exposes only the single write used by the access controller
-    (Req 4.7). Dropping ``find_open_entries``/``close_open_entry`` prevents the
-    retired flow from being reintroduced accidentally.
+    The base flow writes exactly one record per detection (Req 4.7). The
+    dual-camera exit feature additionally reads back the open entry for an
+    exiting plate and closes it, reviving the correlation the monitoring
+    migration had parked (dual-camera-exit-correlation Req 5). The two
+    correlation methods are used only on the OUTBOUND path; single-camera /
+    flat-log deployments call only :meth:`append`.
     """
 
     def append(self, record: EventRecord) -> int:
@@ -149,6 +151,26 @@ class EventLogRepository(Protocol):
         Exactly-once per detection. The returned id is the MySQL-assigned
         ``ANPR_Log.Log_ID``, required to attach child rows such as the ``Images``
         reference, whose ``Log_ID`` foreign key is NOT NULL.
+        """
+        ...
+
+    def find_open_entry(self, normalized_plate: str) -> Optional[EventRecord]:
+        """Return the most recent OPEN entry for a plate, or None.
+
+        Looks up the Open_Entry_Record for ``normalized_plate``
+        (``Event_Kind = ENTRY`` AND ``Entry_State = OPEN``), most recent first,
+        for exit correlation (Req 5.1). Returns ``None`` when no open entry
+        exists (an Exit_Anomaly).
+        """
+        ...
+
+    def close_entry(self, entry_log_id: int, closed_by_log_id: int) -> int:
+        """Close an open entry, returning the number of rows affected.
+
+        Sets ``Entry_State = CLOSED`` and ``Closed_By_Log_ID`` on the entry whose
+        ``Log_ID`` is ``entry_log_id``, guarded by ``Entry_State = OPEN`` so the
+        close is idempotent and race-safe: closing an already-closed entry
+        affects zero rows and is not an error (Req 5.2, 5.6).
         """
         ...
 
