@@ -25,6 +25,7 @@ anpr/images/
 /images/
 *.db
 best.pt
+best_new.pt
 
 # AWS RDS CA bundle (public cert, downloaded per-machine; no need to commit)
 global-bundle.pem

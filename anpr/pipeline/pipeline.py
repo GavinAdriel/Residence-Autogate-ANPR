@@ -39,8 +39,8 @@ Responsibilities implemented here (task 12.2):
   :class:`~anpr.pipeline.track_aggregator.TrackAggregator` and tracks absent for
   longer than ``pipeline.track_staleness_frames`` are evicted.
 * **Routing** -- route a format-valid, confident detection directly through the
-  ``AccessController``'s match-and-log; direction resolution is retired in the
-  monitoring migration (Req 5.1, 7.2-7.4).
+  ``AccessController``'s match-and-log, passing the direction derived from this
+  pipeline's camera id (Req 5.1).
 * **Event assembly** -- build a :class:`~anpr.core.models.DetectionEvent`
   accumulating the detection and OCR confidences and the end-to-end processing
   latency (frame acquisition -> access decision) (design Event flow, Req 15.1).
@@ -280,11 +280,11 @@ class DetectionPipeline:
         self._normalizer = normalizer
         self._access = access_controller
 
-        # Dual-camera direction (dual-camera-exit-correlation). In single-camera
-        # mode ``direction_resolver`` is None and no direction is resolved: the
-        # access controller keeps its flat behavior. In dual mode the resolver
-        # maps this pipeline's ``camera_id`` to a DirectionOutcome, stamped on
-        # each event and passed to the controller.
+        # Direction comes from the camera (dual-camera-exit-correlation): the
+        # resolver maps this pipeline's ``camera_id`` to a DirectionOutcome,
+        # stamped on each event and passed to the controller. The composition
+        # root always supplies one; ``None`` (direct construction in tests)
+        # means no direction and the controller keeps its flat behavior.
         self._camera_id = camera_id
         self._direction_resolver = direction_resolver
         self._reconciliation_window_s = max(0.0, float(reconciliation_window_s))
@@ -365,9 +365,10 @@ class DetectionPipeline:
     ) -> "DetectionPipeline":
         """Build a pipeline from a ``ConfigProvider`` and injected collaborators.
 
-        Reads ``camera.target_fps`` (Req 1.1), ``camera.reconnect_interval_s``
-        (Req 1.4/1.5), ``camera.inactivity_timeout_s`` (Req 1.6),
-        ``ocr.confidence_threshold`` (Req 3.4), ``ocr.timeout_ms`` (Req 3.5), and
+        Reads ``pipeline.target_fps`` (Req 1.1), ``pipeline.reconnect_interval_s``
+        (Req 1.4/1.5), ``pipeline.inactivity_timeout_s`` (Req 1.6),
+        ``pipeline.reconciliation_window_s``, ``ocr.confidence_threshold``
+        (Req 3.4), ``ocr.timeout_ms`` (Req 3.5), and
         ``pipeline.track_staleness_frames`` (the per-track eviction grace
         window), falling back to the documented defaults when a key is absent.
         Any keyword override is forwarded to the constructor (e.g. injectable
@@ -379,12 +380,12 @@ class DetectionPipeline:
             ocr_engine,
             normalizer,
             access_controller,
-            target_fps=_cfg(config, "camera.target_fps", DEFAULT_TARGET_FPS),
+            target_fps=_cfg(config, "pipeline.target_fps", DEFAULT_TARGET_FPS),
             reconnect_interval_s=_cfg(
-                config, "camera.reconnect_interval_s", DEFAULT_RECONNECT_INTERVAL_S
+                config, "pipeline.reconnect_interval_s", DEFAULT_RECONNECT_INTERVAL_S
             ),
             inactivity_timeout_s=_cfg(
-                config, "camera.inactivity_timeout_s", DEFAULT_INACTIVITY_TIMEOUT_S
+                config, "pipeline.inactivity_timeout_s", DEFAULT_INACTIVITY_TIMEOUT_S
             ),
             ocr_confidence_threshold=_cfg(
                 config, "ocr.confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD
@@ -395,7 +396,7 @@ class DetectionPipeline:
             ),
             reconciliation_window_s=_cfg(
                 config,
-                "direction.reconciliation_window_s",
+                "pipeline.reconciliation_window_s",
                 DEFAULT_RECONCILIATION_WINDOW_S,
             ),
             **overrides,
@@ -741,10 +742,8 @@ class DetectionPipeline:
             return self._surface(event, acquired_at, reason)
 
         # A confident, format-valid reading is routed through the access
-        # controller's match-and-log. In dual-camera mode the direction is
-        # resolved from this pipeline's camera id and passed to the controller;
-        # in single-camera mode no resolver is wired and direction stays None
-        # (the controller keeps its flat behavior).
+        # controller's match-and-log. The direction is resolved from this
+        # pipeline's camera id and passed to the controller.
         self._finalize_latency(event, acquired_at)
         direction = self._resolve_direction()
         event.direction = direction
@@ -769,9 +768,9 @@ class DetectionPipeline:
             self._emit(event)
             return event
 
-        # Single-camera mode (direction is None) calls with the original
+        # With no resolver (direction is None) call with the original
         # one-argument signature so existing collaborators/fakes are unaffected;
-        # dual-camera mode passes the resolved direction.
+        # otherwise pass the resolved direction.
         if direction is None:
             decision = self._access.handle_detection(event)
         else:
@@ -795,9 +794,9 @@ class DetectionPipeline:
     def _resolve_direction(self) -> Optional[DirectionOutcome]:
         """Resolve this pipeline's travel direction from its camera id.
 
-        Returns ``None`` in single-camera mode (no resolver wired), so the
-        access controller keeps its flat behavior. In dual-camera mode the
-        :class:`DualCameraResolver` maps this pipeline's ``camera_id`` to a
+        Returns ``None`` only when no resolver is wired (direct construction in
+        tests), so the access controller keeps its flat behavior. Otherwise the
+        :class:`CameraDirectionResolver` maps this pipeline's ``camera_id`` to a
         :class:`DirectionOutcome` (INBOUND / OUTBOUND / UNDETERMINED).
         """
         resolver = self._direction_resolver

@@ -1,14 +1,15 @@
-"""Headless wiring test for dual-camera composition (Task 6.2).
+"""Headless wiring test for camera composition (Task 6.2).
 
-Exercises :func:`anpr.main.build_camera_pipelines` in both modes with fakes and
-no live MySQL, PyQt5, camera, or weights:
+Exercises :func:`anpr.main.build_camera_pipelines` with fakes and no live MySQL,
+PyQt5, camera, or weights. One pipeline is built per configured ``cameras.*``
+entry and the key name is the direction:
 
-* single-camera (default ``direction.mode``) -> exactly one primary pipeline,
-  unchanged behavior (Req 7.1);
-* ``dual_camera`` -> two pipelines (inbound primary + outbound), sharing the
+* only ``cameras.inbound`` (or only ``cameras.outbound``) -> exactly one primary
+  pipeline with a fixed direction;
+* both -> two pipelines (inbound primary + outbound), sharing the
   detector/OCR/normalizer/access-controller, each with its OWN TrackAggregator
-  (Req 6.1), both carrying the shared DualCameraResolver and the right camera id
-  (Req 2.4);
+  (Req 6.1), both carrying the shared CameraDirectionResolver and the right
+  camera id (Req 2.4);
 * the composition imports no PyQt5 (Req 7.3).
 """
 
@@ -22,7 +23,7 @@ import anpr.main as main
 from anpr.config.provider import ConfigProvider
 from anpr.core.access_controller import AccessController
 from anpr.core.models import DirectionOutcome
-from anpr.direction.resolver import DualCameraResolver
+from anpr.direction.resolver import CameraDirectionResolver
 from anpr.pipeline.track_aggregator import TrackAggregator
 
 pytestmark = pytest.mark.smoke
@@ -82,10 +83,32 @@ def _pyqt_modules() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Single-camera mode (Req 7.1)
+# Single-camera (one ``cameras.*`` entry, fixed direction)
 # ---------------------------------------------------------------------------
-def test_single_camera_mode_builds_one_primary_pipeline() -> None:
-    config = ConfigProvider(env={"ANPR_CAMERA__TYPE": "webcam"})
+def _single_config(tmp_path, side: str, cam_id: int) -> ConfigProvider:
+    cfg = tmp_path / "single.yaml"
+    cfg.write_text(
+        "cameras:\n"
+        f"  {side}:\n"
+        f"    id: {cam_id}\n"
+        "    type: ip\n"
+        "    stream_url: rtsp://only/stream\n",
+        encoding="utf-8",
+    )
+    return ConfigProvider(config_path=cfg, env={})
+
+
+@pytest.mark.parametrize(
+    ("side", "cam_id", "expected"),
+    [
+        ("inbound", 1, DirectionOutcome.INBOUND),
+        ("outbound", 2, DirectionOutcome.OUTBOUND),
+    ],
+)
+def test_single_camera_builds_one_primary_pipeline_with_fixed_direction(
+    tmp_path, side, cam_id, expected
+) -> None:
+    config = _single_config(tmp_path, side, cam_id)
     detector, ocr, normalizer, access = _collaborators()
 
     pipelines = main.build_camera_pipelines(config, detector, ocr, normalizer, access)
@@ -93,21 +116,32 @@ def test_single_camera_mode_builds_one_primary_pipeline() -> None:
     assert len(pipelines) == 1
     cp = pipelines[0]
     assert cp.is_primary is True
-    # No direction resolver wired in single-camera mode.
-    assert cp.pipeline._direction_resolver is None
+    assert cp.label == side
+    assert cp.camera_id == cam_id
+    assert cp.pipeline._resolve_direction() is expected
+
+
+def test_no_cameras_configured_halts_startup(tmp_path) -> None:
+    cfg = tmp_path / "none.yaml"
+    cfg.write_text("environment:\n  label: local-test\n", encoding="utf-8")
+    detector, ocr, normalizer, access = _collaborators()
+
+    with pytest.raises(main.StartupError):
+        main.build_camera_pipelines(
+            ConfigProvider(config_path=cfg, env={}), detector, ocr, normalizer, access
+        )
 
 
 # ---------------------------------------------------------------------------
-# Dual-camera mode (Req 2.4, 6.1, 7.3)
+# Two cameras (Req 2.4, 6.1, 7.3)
 # ---------------------------------------------------------------------------
 def _dual_config() -> ConfigProvider:
     return ConfigProvider(
         env={
-            "ANPR_DIRECTION__MODE": "dual_camera",
-            "ANPR_DIRECTION__CAMERAS__INBOUND__TYPE": "ip",
-            "ANPR_DIRECTION__CAMERAS__INBOUND__STREAM_URL": "rtsp://in/stream",
-            "ANPR_DIRECTION__CAMERAS__OUTBOUND__TYPE": "ip",
-            "ANPR_DIRECTION__CAMERAS__OUTBOUND__STREAM_URL": "rtsp://out/stream",
+            "ANPR_CAMERAS__INBOUND__TYPE": "ip",
+            "ANPR_CAMERAS__INBOUND__STREAM_URL": "rtsp://in/stream",
+            "ANPR_CAMERAS__OUTBOUND__TYPE": "ip",
+            "ANPR_CAMERAS__OUTBOUND__STREAM_URL": "rtsp://out/stream",
         }
     )
 
@@ -138,8 +172,8 @@ def test_dual_camera_mode_builds_two_pipelines_with_shared_collaborators() -> No
     assert in_p.track_aggregator is not out_p.track_aggregator
     assert isinstance(in_p.track_aggregator, TrackAggregator)
 
-    # Both share one DualCameraResolver and one RecentEntryRegistry.
-    assert isinstance(in_p._direction_resolver, DualCameraResolver)
+    # Both share one CameraDirectionResolver and one RecentEntryRegistry.
+    assert isinstance(in_p._direction_resolver, CameraDirectionResolver)
     assert in_p._direction_resolver is out_p._direction_resolver
     assert in_p._recent_entries is out_p._recent_entries
 

@@ -97,35 +97,29 @@ def test_default_config_has_no_database_location() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Requirement 2.6 -- no direction section, no direction.* validation error
+# Requirement 2.6 -- cameras block replaces camera/direction; default is valid
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_default_config_has_direction_section_in_single_mode() -> None:
-    """The ``direction`` section is present and defaults to single-camera mode.
-
-    Supersedes the earlier "no direction section" expectation: the
-    dual-camera-exit-correlation feature revives ``direction.*``. The default
-    mode preserves the single-camera behavior, so single-camera deployments are
-    unaffected.
-    """
+def test_default_config_has_cameras_and_no_direction_section() -> None:
+    """Direction is the ``cameras`` key name; no ``direction`` or ``camera`` block."""
     provider = ConfigProvider(env={})
 
-    section = provider.get_section("direction")
-    assert section["mode"] == "single_camera_trajectory"
+    cameras = provider.get_section("cameras")
+    assert set(cameras) == {"inbound", "outbound"}
+    with pytest.raises(KeyError):
+        provider.get_section("direction")
+    with pytest.raises(KeyError):
+        provider.get_section("camera")
 
 
 @pytest.mark.unit
-def test_validate_emits_no_direction_error_in_default_mode() -> None:
-    """The shipped (single-camera default) configuration validates cleanly.
-
-    In the default ``single_camera_trajectory`` mode no ``direction.*`` error is
-    reported and the whole default config is valid.
-    """
+def test_validate_emits_no_camera_error_in_default_config() -> None:
+    """The shipped configuration validates cleanly, including ``cameras.*``."""
     provider = ConfigProvider(env={})
     errors = provider.validate()
 
-    direction_errors = [e for e in errors if e.key.startswith("direction")]
-    assert direction_errors == [], f"unexpected direction.* errors: {direction_errors}"
+    camera_errors = [e for e in errors if e.key.startswith("camera")]
+    assert camera_errors == [], f"unexpected cameras.* errors: {camera_errors}"
     # The shipped default config is fully valid.
     assert errors == [], f"default config unexpectedly invalid: {errors}"
 

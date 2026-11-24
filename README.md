@@ -14,7 +14,7 @@ An Automatic Number Plate Recognition (ANPR) autogate system built for a single-
 ## Architecture Overview
 
 ```
-Camera ─► Detection (YOLO) ─► OCR (PaddleOCR) ─► Normalizer ─► Direction Resolver
+Camera ─► Detection (YOLO) ─► OCR (PaddleOCR) ─► Normalizer ─► Direction (from camera)
                                                                         │
                                                           Access Controller
                                                                         │
@@ -92,11 +92,12 @@ Configuration lives in `anpr/config/default_config.yaml`. Key settings:
 
 | Section | Setting | Description |
 |---------|---------|-------------|
-| `camera.type` | `webcam` / `ip` | Video source type (single-camera mode) |
-| `camera.device_index` | `0` | Webcam index |
-| `camera.target_fps` | `15` | Frame ingestion rate |
-| `direction.mode` | `single_camera_trajectory` / `dual_camera` | Direction resolution mode |
-| `direction.reconciliation_window_s` | `3` | Dual-camera same-pass window (seconds) |
+| `cameras.<inbound\|outbound>.id` | `1` / `2` | Seeded `Camera.Camera_ID` row for that camera |
+| `cameras.<inbound\|outbound>.type` | `webcam` / `ip` | Video source type |
+| `cameras.<inbound\|outbound>.device_index` | `0` / `1` | Webcam index (`type: webcam`) |
+| `cameras.<inbound\|outbound>.stream_url` | `rtsp://...` | Stream address (`type: ip`) |
+| `pipeline.target_fps` | `30` | Frame ingestion rate (all cameras) |
+| `pipeline.reconciliation_window_s` | `3` | Two-camera same-pass window (seconds) |
 | `gate.mode` | `simulation` / `hardware` | Gate control mode |
 | `model.detection_threshold` | `0.5` | YOLO confidence threshold |
 | `ocr.confidence_threshold` | `0.70` | OCR confidence threshold |
@@ -104,32 +105,37 @@ Configuration lives in `anpr/config/default_config.yaml`. Key settings:
 
 Environment variables override config values using the `ANPR_` prefix with double-underscore separators:
 ```bash
-ANPR_CAMERA__TARGET_FPS=30
+ANPR_PIPELINE__TARGET_FPS=30
+ANPR_CAMERAS__OUTBOUND__DEVICE_INDEX=2
 ANPR_GATE__MODE=hardware
 ```
 
-### Dual-camera mode (direction + exit tickets)
+### Cameras and direction
 
-Set `direction.mode: dual_camera` to run **two IP cameras on one shared gate lane** — one
-facing inbound traffic, one outbound. Direction is derived from which camera saw the
-vehicle, and a guest exit is correlated to its open entry ticket (an unmatched exit is
-surfaced to the guard as an Exit_Anomaly). Each camera reuses the standard
-`type` / `stream_url` keys and maps to a seeded `Camera.Camera_ID` (the Docker init seeds
-`1` = inbound, `2` = outbound):
+The key name under `cameras` **is** the direction. Everything the `inbound` camera sees is
+an entry and everything the `outbound` camera sees is an exit. There is no motion-based
+direction detection and no `direction.mode`; the number of cameras listed decides the setup:
+
+- **One camera** (single-camera gate, fixed direction): keep only `cameras.inbound` or only
+  `cameras.outbound` and delete the other.
+- **Two cameras** (one shared lane, one facing each way): keep both. A guest exit is
+  correlated to its open entry ticket, and an unmatched exit is surfaced to the guard as an
+  Exit_Anomaly.
 
 ```yaml
-direction:
-  mode: dual_camera
-  cameras:
-    inbound:  { id: 1, type: ip, stream_url: "rtsp://user:pass@INBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
-    outbound: { id: 2, type: ip, stream_url: "rtsp://user:pass@OUTBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
-  reconciliation_window_s: 3
+cameras:
+  inbound:  { id: 1, type: ip, stream_url: "rtsp://user:pass@INBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
+  outbound: { id: 2, type: ip, stream_url: "rtsp://user:pass@OUTBOUND-IP:554/cam/realmonitor?channel=1&subtype=0" }
 ```
 
-Single-camera mode is the default and is unaffected. The only network egress remains the
-local IP-camera stream(s) — offline-by-default still holds. A remote (e.g. RDS) database
-that does not run the Docker init SQL must insert the `Camera_ID = 2` row manually before
-enabling dual mode.
+For webcams use `type: webcam` with a distinct `device_index` per camera. Each `id` must be a
+seeded `Camera.Camera_ID` (the Docker init seeds `1` = inbound, `2` = outbound). The only
+network egress remains the local IP-camera stream(s), so offline-by-default still holds. A
+remote (e.g. RDS) database that does not run the Docker init SQL must insert the
+`Camera_ID = 2` row manually before using the outbound camera.
+
+If a detection comes from a camera id that is not mapped, its direction is `UNDETERMINED` and
+the event is surfaced to the guard.
 
 ## Running Tests
 
@@ -176,14 +182,15 @@ the Docker-hosted database and phpMyAdmin.
 
    | Vehicle | How it is logged | `classification` | `grant_method` | `direction` | `event_kind` | `entry_state` |
    |---------|------------------|------------------|----------------|-------------|--------------|---------------|
-   | Resident (gate opens) | automatically, on the first confident DB match (OCR then stops for that vehicle) | `RESIDENT` | `AUTOMATIC` | NULL | NULL | `N/A` |
-   | Guest (no match) | only when the guard presses **Open Gate** for the surfaced guest | `GUEST` | `MANUAL` | NULL | NULL | `N/A` |
+   | Resident, inbound camera (gate opens) | automatically, on the first confident DB match (OCR then stops for that vehicle) | `RESIDENT` | `AUTOMATIC` | `INBOUND` | `ENTRY` | `OPEN` |
+   | Resident, outbound camera (gate opens) | automatically, on the first confident DB match | `RESIDENT` | `AUTOMATIC` | `OUTBOUND` | `EXIT` | `N/A` |
+   | Guest (no match) | only when the guard presses **Open Gate** for the surfaced guest | `GUEST` | `MANUAL` | from the camera | from the camera | per direction |
 
    A guest is **not** auto-logged at detection time: it is surfaced to the Guard Dashboard
    (once, carrying its best OCR read), and its single row is written when the guard permits
-   it. A guest the guard never permits produces no row at all. In every row `direction` and
-   `event_kind` are `NULL` and `entry_state` is the `N/A` sentinel, confirming the
-   direction-free match-and-log flow.
+   it. A guest the guard never permits produces no row at all. A guest seen by the outbound
+   camera is matched to its open entry ticket; with no ticket it is an Exit_Anomaly and is
+   surfaced to the guard instead of opening the gate.
 
 Stop the database with `docker compose down` (data persists in the named volume) or
 `docker compose down -v` to delete all data.
@@ -195,7 +202,7 @@ anpr/
 ├── config/          # Configuration loading and validation
 ├── core/            # Domain models, interfaces, access controller, normalizer
 ├── detection/       # YOLO vehicle detector wrapper
-├── direction/       # Direction resolver (inbound/outbound)
+├── direction/       # Camera-id -> inbound/outbound direction resolver
 ├── gate/            # Gate controller (simulation + hardware)
 ├── imaging/         # Image capture and storage
 ├── ocr/             # PaddleOCR engine wrapper

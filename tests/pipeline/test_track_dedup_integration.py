@@ -212,9 +212,9 @@ def test_from_config_reads_track_staleness_frames() -> None:
 
     config = DictConfig(
         {
-            "camera.target_fps": 30,
-            "camera.reconnect_interval_s": 5,
-            "camera.inactivity_timeout_s": 10,
+            "pipeline.target_fps": 30,
+            "pipeline.reconnect_interval_s": 5,
+            "pipeline.inactivity_timeout_s": 10,
             "ocr.confidence_threshold": 0.70,
             "ocr.timeout_ms": 2000,
             "pipeline.track_staleness_frames": 4,

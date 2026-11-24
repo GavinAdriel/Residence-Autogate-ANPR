@@ -22,7 +22,7 @@ from anpr.core.models import (
     GrantMethod,
     OcrResult,
 )
-from anpr.direction.resolver import DualCameraResolver
+from anpr.direction.resolver import CameraDirectionResolver
 from anpr.pipeline.pipeline import RecentEntryRegistry
 from tests.pipeline.test_pipeline import (
     FakeClock,
@@ -74,7 +74,7 @@ def _dual_pipeline(*, camera_id, resolver, access, registry, clock=None, window=
 @pytest.mark.unit
 def test_inbound_camera_stamps_inbound_direction() -> None:
     """The inbound camera's events are passed to the controller as INBOUND."""
-    resolver = DualCameraResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
+    resolver = CameraDirectionResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
     access = DirectionAwareAccess()
     registry = RecentEntryRegistry()
     pipeline, *_ = _dual_pipeline(
@@ -93,7 +93,7 @@ def test_inbound_camera_stamps_inbound_direction() -> None:
 @pytest.mark.unit
 def test_outbound_camera_stamps_outbound_direction() -> None:
     """The outbound camera's events are passed to the controller as OUTBOUND."""
-    resolver = DualCameraResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
+    resolver = CameraDirectionResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
     access = DirectionAwareAccess()
     registry = RecentEntryRegistry()
     pipeline, *_ = _dual_pipeline(
@@ -112,7 +112,7 @@ def test_outbound_camera_stamps_outbound_direction() -> None:
 @pytest.mark.unit
 def test_two_cameras_same_track_id_do_not_collide() -> None:
     """Identical track_id on two pipelines (own aggregators) are independent (Req 6.1)."""
-    resolver = DualCameraResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
+    resolver = CameraDirectionResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
     registry = RecentEntryRegistry()
 
     in_access = DirectionAwareAccess()
@@ -145,7 +145,7 @@ def test_two_cameras_same_track_id_do_not_collide() -> None:
 @pytest.mark.unit
 def test_same_pass_outbound_glimpse_is_suppressed() -> None:
     """An OUTBOUND read within the window of the INBOUND entry is not exited (Req 6.3)."""
-    resolver = DualCameraResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
+    resolver = CameraDirectionResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
     registry = RecentEntryRegistry()
     clock = FakeClock()
 
@@ -171,7 +171,7 @@ def test_same_pass_outbound_glimpse_is_suppressed() -> None:
 @pytest.mark.unit
 def test_genuine_later_exit_outside_window_correlates() -> None:
     """An OUTBOUND read after the window is a real exit and reaches the controller (Req 6.4)."""
-    resolver = DualCameraResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
+    resolver = CameraDirectionResolver({1: DirectionOutcome.INBOUND, 2: DirectionOutcome.OUTBOUND})
     registry = RecentEntryRegistry()
 
     in_access = DirectionAwareAccess()

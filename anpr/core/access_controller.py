@@ -43,11 +43,12 @@ Match-and-log (Requirement 4, 5):
 * A resident-lookup fault requests no automatic gate-open, logs one safety
   record with the normalized plate string, and surfaces the event to the guard
   (Req 4.6).
-* Every record that *is* written is flat: ``direction=None``,
-  ``event_kind=None``, ``entry_state=EntryState.NA``, and
-  ``closed_by_event_id=None`` -- entry/exit correlation is retired (Req 5.2,
-  5.3, 5.4). The earlier "exactly one record in every outcome" guarantee no
-  longer holds for guests, which are logged only on the guard's action.
+* The direction passed in comes from the camera that saw the vehicle: INBOUND
+  writes an ``ENTRY/OPEN`` row, OUTBOUND an ``EXIT`` row that closes the open
+  entry, and ``None`` / ``UNDETERMINED`` a flat row (``direction=None``,
+  ``event_kind=None``, ``entry_state=EntryState.NA``). Guests are logged only on
+  the guard's action, so "exactly one record in every outcome" does not hold
+  for them.
 
 See .kiro/specs/mysql-monitoring-migration/design.md (Access controller) and
 requirements.md (Requirements 4 and 5) for the authoritative definitions.

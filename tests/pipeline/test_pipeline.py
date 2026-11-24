@@ -208,9 +208,9 @@ class DictConfig:
 def test_from_config_reads_camera_and_ocr_settings():
     config = DictConfig(
         {
-            "camera.target_fps": 30,
-            "camera.reconnect_interval_s": 7,
-            "camera.inactivity_timeout_s": 12,
+            "pipeline.target_fps": 30,
+            "pipeline.reconnect_interval_s": 7,
+            "pipeline.inactivity_timeout_s": 12,
             "ocr.confidence_threshold": 0.8,
             "ocr.timeout_ms": 1500,
         }

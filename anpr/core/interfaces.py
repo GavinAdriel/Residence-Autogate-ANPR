@@ -34,7 +34,6 @@ from anpr.core.models import (
     ImageRef,
     OcrResult,
     ResidentRecord,
-    TrackHistory,
 )
 
 # ``Frame`` is a NumPy image array (H x W x C) at runtime; defined above with a
@@ -113,10 +112,10 @@ class GateController(Protocol):
 
 @runtime_checkable
 class DirectionResolver(Protocol):
-    """Resolves the travel direction of a tracked vehicle."""
+    """Resolves travel direction from the camera that produced a detection."""
 
-    def resolve(self, track: TrackHistory) -> DirectionOutcome:
-        """Resolve a track history into a direction outcome."""
+    def resolve_for_camera(self, camera_id: Optional[int]) -> DirectionOutcome:
+        """Return INBOUND/OUTBOUND for a mapped camera id, else UNDETERMINED."""
         ...
 
 

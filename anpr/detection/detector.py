@@ -24,7 +24,7 @@ Detection (Requirement 2.2, 2.3, 2.4):
 
 * :meth:`detect` runs Ultralytics **track** mode (``persist=True``) so each
   emitted :class:`Detection` carries a persistent ``track_id`` across frames,
-  which the single-camera trajectory ``Direction_Resolver`` relies on.
+  which the per-track de-duplication relies on.
 * Every emitted bounding box is clamped to lie within the frame's pixel bounds
   ``[0, width] x [0, height]`` and every confidence is clamped to the inclusive
   range ``0.0`` to ``1.0`` (Req 2.2).

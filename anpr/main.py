@@ -5,8 +5,8 @@ implementations are selected and wired together (Requirement 14.2, 14.4). No
 core component imports a concrete peer implementation: every concrete choice --
 which :class:`VideoSource`, which :class:`GateController`, the MySQL
 repositories, and the image store -- is made here from configuration values
-alone. The running system is reduced to the Guard monitoring surface only; no
-direction resolver and no Admin dashboard are wired (Req 6.2, 6.3).
+alone. Direction comes from which camera saw the vehicle (``cameras.inbound`` /
+``cameras.outbound``). Only the Guard dashboard is wired (Req 6.2, 6.3).
 
 Startup ordering (see design.md "Startup ordering" and Requirements 9.6, 14.5):
 
@@ -20,7 +20,7 @@ Startup ordering (see design.md "Startup ordering" and Requirements 9.6, 14.5):
    connect failure or a missing table halts startup (Req 1.4, 1.5, 9.7).
 3. Build the persistence repositories (MySQL-backed resident + event-log) and
    the image store from ``storage.*`` over the shared connection.
-4. Select the video source from ``camera.type`` (Req 1.2, 1.3).
+4. Select each video source from ``cameras.<side>.type`` (Req 1.2, 1.3).
 5. Select the gate from ``gate.mode`` (Req 6.4).
 6. Load the detector weights *before* the first frame / before the pipeline
    starts; on a weights-load failure log the offending path and halt pipeline
@@ -32,7 +32,7 @@ Startup ordering (see design.md "Startup ordering" and Requirements 9.6, 14.5):
 
 Offline by default (Req 14.3): the composition root performs no outbound cloud
 or internet connection; the only network egress is the local MySQL connection
-and the optional IP-camera stream selected via ``camera.type = ip``.
+and the optional IP-camera stream selected via ``cameras.<side>.type = ip``.
 
 The non-GUI builders and :func:`build_application` are deliberately free of any
 PyQt5 dependency so the wiring can be exercised headlessly; the Guard dashboard
@@ -76,10 +76,7 @@ from anpr.ocr.engine import PaddleOcrEngine
 from anpr.persistence.db import Database, MissingTableError
 from anpr.persistence.event_log_repo import MySqlEventLogRepository
 from anpr.persistence.resident_repo import MySqlResidentRepository
-from anpr.direction.resolver import (
-    MODE_DUAL_CAMERA,
-    create_direction_resolver,
-)
+from anpr.direction.resolver import create_direction_resolver
 from anpr.pipeline.pipeline import (
     DetectionPipeline,
     RecentEntryRegistry,
@@ -160,8 +157,30 @@ def resolve_environment_label(config: ConfigProvider) -> Optional[EnvironmentLab
         return None
 
 
+CAMERA_SIDES = ("inbound", "outbound")
+
+
+def configured_camera_sides(config: ConfigProvider) -> list[str]:
+    """Return the configured ``cameras.*`` sides, inbound first.
+
+    The key name is the direction, so the sides present decide the mode: one
+    side is a single-camera gate with a fixed direction, both sides is a
+    two-camera lane. Raises :class:`StartupError` when none is configured.
+    """
+    sides = [side for side in CAMERA_SIDES if _cfg(config, f"cameras.{side}", None)]
+    if not sides:
+        raise StartupError(
+            "No camera configured: set cameras.inbound and/or cameras.outbound."
+        )
+    return sides
+
+
 def resolve_camera_id(config: ConfigProvider) -> Optional[int]:
-    """Resolve ``camera.id`` into the ``ANPR_Log.Camera_ID`` value to log.
+    """Resolve the primary camera's id into the ``ANPR_Log.Camera_ID`` to log.
+
+    The primary camera is the first configured side (inbound, else outbound). The
+    controller uses it only as a fallback; every detection carries its own
+    camera id.
 
     ``ANPR_Log.Camera_ID`` is NOT NULL with a foreign key to ``Camera``, so this
     id must match a seeded ``Camera`` row or MySQL rejects every event insert.
@@ -169,38 +188,26 @@ def resolve_camera_id(config: ConfigProvider) -> Optional[int]:
     which surfaces the misconfiguration as a failing write instead of writing
     events against the wrong camera.
     """
-    raw = _cfg(config, "camera.id", None)
-    if raw is None:
+    sides = [s for s in CAMERA_SIDES if _cfg(config, f"cameras.{s}", None)]
+    if not sides:
         logger.warning(
-            "camera.id is not configured; ANPR_Log.Camera_ID is NOT NULL, so "
-            "event writes will fail until it is set to a seeded Camera row."
+            "No cameras configured; ANPR_Log.Camera_ID is NOT NULL, so event "
+            "writes will fail until a camera is configured."
         )
         return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        logger.error("Invalid camera.id %r; expected an integer.", raw)
-        return None
+    return _resolve_side_camera_id(config, sides[0])
 
 
 # ---------------------------------------------------------------------------
 # Concrete-implementation selection (purely from config values, Req 14.2, 14.4)
 # ---------------------------------------------------------------------------
-def build_video_source(config: ConfigProvider) -> VideoSource:
-    """Select the video source from ``camera.type`` (Req 1.2, 1.3, 14.4).
-
-    ``webcam`` -> :class:`WebcamVideoSource` addressed by ``camera.device_index``;
-    ``ip`` -> :class:`IpCameraVideoSource` addressed by ``camera.stream_url``.
-    """
-    return _build_source_from(config, "camera")
-
-
 def _build_source_from(config: ConfigProvider, prefix: str) -> VideoSource:
     """Build a video source from a camera config sub-tree rooted at ``prefix``.
 
-    Reads ``{prefix}.type`` and the matching address key, so the same selection
-    logic serves the single top-level ``camera.*`` block and each per-camera
-    block under ``direction.cameras.*`` in dual-camera mode (Req 1.1).
+    Reads ``{prefix}.type`` and the matching address key. ``prefix`` is
+    ``cameras.inbound`` or ``cameras.outbound`` (Req 1.1, 1.2, 1.3, 14.4):
+    ``webcam`` -> :class:`WebcamVideoSource` addressed by ``device_index``;
+    ``ip`` -> :class:`IpCameraVideoSource` addressed by ``stream_url``.
     """
     camera_type = _cfg(config, f"{prefix}.type", CAMERA_WEBCAM)
     if camera_type == CAMERA_WEBCAM:
@@ -379,8 +386,9 @@ def build_access_controller(
 ) -> AccessController:
     """Wire the pure access-control orchestrator over its collaborators.
 
-    ``camera_id`` comes from ``camera.id`` and is stamped onto every logged
-    event: ``ANPR_Log.Camera_ID`` is NOT NULL with a foreign key to ``Camera``.
+    ``camera_id`` (the primary ``cameras.*.id``) is the fallback stamped onto a
+    logged event that carries no camera id of its own:
+    ``ANPR_Log.Camera_ID`` is NOT NULL with a foreign key to ``Camera``.
     ``image_store`` lets the controller attach a captured image to the logged
     event once MySQL has assigned its ``Log_ID``.
     """
@@ -394,45 +402,8 @@ def build_access_controller(
     )
 
 
-def build_pipeline(
-    config: ConfigProvider,
-    video_source: VideoSource,
-    detector: YoloVehicleDetector,
-    ocr_engine: OcrEngine,
-    normalizer: PlateNormalizer,
-    access_controller: AccessController,
-    *,
-    track_aggregator: Optional[TrackAggregator] = None,
-    on_event: Optional[Callable[[Any], None]] = None,
-    on_manual_review: Optional[Callable[[Any], None]] = None,
-) -> DetectionPipeline:
-    """Construct the :class:`DetectionPipeline` from config and collaborators.
-
-    Camera/OCR tuning values are read from configuration by
-    :meth:`DetectionPipeline.from_config`; the live-feed and manual-review
-    callbacks (wired to the Guard_Dashboard by :func:`main`) are forwarded here.
-
-    ``track_aggregator`` is the per-track deduplication state (one logged event
-    per vehicle). It is created here and shared with the Guard_Dashboard so a
-    guard-permitted guest marks its track resolved and is never re-surfaced or
-    re-processed. Supplying one keeps the composition root the single owner of
-    the shared instance.
-    """
-    return DetectionPipeline.from_config(
-        config,
-        video_source,
-        detector,
-        ocr_engine,
-        normalizer,
-        access_controller,
-        track_aggregator=track_aggregator,
-        on_event=on_event,
-        on_manual_review=on_manual_review,
-    )
-
-
 # ---------------------------------------------------------------------------
-# Camera pipelines (single- or dual-camera, selected from direction.mode)
+# Camera pipelines (one per configured ``cameras.*`` entry)
 # ---------------------------------------------------------------------------
 @dataclass
 class CameraPipeline:
@@ -465,74 +436,41 @@ def build_camera_pipelines(
     on_manual_review: Optional[Callable[[Any], None]] = None,
     detector_factory: Optional[Callable[[], Any]] = None,
 ) -> list[CameraPipeline]:
-    """Build the camera pipeline(s), selected purely from ``direction.mode``.
+    """Build one pipeline per configured ``cameras.*`` entry.
 
-    * ``single_camera_trajectory`` (default) -> exactly one pipeline over the
-      top-level ``camera.*`` source, preserving the existing single-camera
-      behavior (Req 7.1).
-    * ``dual_camera`` -> two pipelines, one per camera under
-      ``direction.cameras.{inbound,outbound}``, sharing the detector, OCR,
-      normalizer, gate, repositories, and image store, plus a shared
-      :class:`DualCameraResolver` (direction by camera) and a shared
-      :class:`RecentEntryRegistry` (same-pass reconciliation). Each pipeline has
-      its OWN :class:`TrackAggregator` so identical tracker ids never collide
-      (Req 6.1).
+    The key name is the direction: ``cameras.inbound`` is INBOUND and
+    ``cameras.outbound`` is OUTBOUND. One entry gives a single-camera gate with a
+    fixed direction; both entries give a two-camera lane. All pipelines share the
+    detector, OCR, normalizer, access controller, a camera-id direction resolver
+    and a :class:`RecentEntryRegistry` (same-pass reconciliation). Each pipeline
+    has its OWN :class:`TrackAggregator` so identical tracker ids never collide
+    (Req 6.1). The first configured side (inbound, else outbound) is primary.
 
     ``detector_factory`` (optional) builds an additional, already-loaded detector.
-    In dual-camera mode the first (inbound) pipeline uses ``detector`` and each
-    further pipeline gets its own instance from the factory, so every camera has
-    its own model and tracker state. A shared ``track(persist=True)`` model would
-    interleave both cameras' frames in one tracker (mixing track ids) and race on
-    its lazy first-call setup across the pipeline threads.
+    The primary pipeline uses ``detector`` and each further pipeline gets its own
+    instance from the factory, so every camera has its own model and tracker
+    state. A shared ``track(persist=True)`` model would interleave both cameras'
+    frames in one tracker (mixing track ids) and race on its lazy first-call
+    setup across the pipeline threads.
     """
-    mode = _cfg(config, "direction.mode", "single_camera_trajectory")
+    sides = configured_camera_sides(config)
 
-    if mode != MODE_DUAL_CAMERA:
-        # Single-camera: one pipeline over the top-level camera source. Direction
-        # stays None so the access controller keeps its flat behavior (Req 7.1).
-        source = build_video_source(config)
-        aggregator = TrackAggregator(
-            staleness_frames=int(_cfg(config, "pipeline.track_staleness_frames", 1))
-        )
-        pipeline = build_pipeline(
-            config,
-            source,
-            detector,
-            ocr_engine,
-            normalizer,
-            access_controller,
-            track_aggregator=aggregator,
-            on_event=on_event,
-            on_manual_review=on_manual_review,
-        )
-        return [
-            CameraPipeline(
-                camera_id=resolve_camera_id(config),
-                label="camera",
-                pipeline=pipeline,
-                track_aggregator=aggregator,
-                is_primary=True,
-            )
-        ]
-
-    # Dual-camera: build the shared resolver + reconciliation registry once.
-    # Each pipeline reads its own reconciliation window from config via
-    # ``from_config``.
+    # Shared resolver + reconciliation registry, built once. Each pipeline reads
+    # ``pipeline.reconciliation_window_s`` itself via ``from_config``.
     resolver = create_direction_resolver(config)
     registry = RecentEntryRegistry()
     staleness = int(_cfg(config, "pipeline.track_staleness_frames", 1))
 
     pipelines: list[CameraPipeline] = []
-    for side, is_primary in (("inbound", True), ("outbound", False)):
-        prefix = f"direction.cameras.{side}"
+    for index, side in enumerate(sides):
+        is_primary = index == 0
+        prefix = f"cameras.{side}"
         camera_id = _resolve_side_camera_id(config, side)
         source = _build_source_from(config, prefix)
         aggregator = TrackAggregator(staleness_frames=staleness)
         side_detector = (
             detector if (is_primary or detector_factory is None) else detector_factory()
         )
-        # ``from_config`` reads ``direction.reconciliation_window_s`` itself, so
-        # it is not passed here (passing it too would duplicate the keyword).
         pipeline = DetectionPipeline.from_config(
             config,
             source,
@@ -564,15 +502,15 @@ def build_camera_pipelines(
 
 
 def _resolve_side_camera_id(config: ConfigProvider, side: str) -> Optional[int]:
-    """Resolve ``direction.cameras.{side}.id`` to an int Camera_ID (or None)."""
-    raw = _cfg(config, f"direction.cameras.{side}.id", None)
+    """Resolve ``cameras.{side}.id`` to an int Camera_ID (or None)."""
+    raw = _cfg(config, f"cameras.{side}.id", None)
     if raw is None:
-        logger.warning("direction.cameras.%s.id is not configured.", side)
+        logger.warning("cameras.%s.id is not configured.", side)
         return None
     try:
         return int(raw)
     except (TypeError, ValueError):
-        logger.error("Invalid direction.cameras.%s.id %r; expected integer.", side, raw)
+        logger.error("Invalid cameras.%s.id %r; expected integer.", side, raw)
         return None
 
 
@@ -602,7 +540,7 @@ class Application:
     access_controller: AccessController
     track_aggregator: TrackAggregator
     pipeline: DetectionPipeline
-    # All camera pipelines (one in single-camera mode, two in dual-camera mode).
+    # All camera pipelines (one per configured ``cameras.*`` entry).
     # ``pipeline``/``track_aggregator``/``video_source`` above mirror the primary
     # pipeline so existing single-camera callers and tests are unaffected.
     camera_pipelines: list["CameraPipeline"] = field(default_factory=list)
@@ -645,7 +583,7 @@ def build_application(
     # Step 4-5: concrete selection purely from config (Req 14.2, 14.4).
     gate = build_gate(config, hardware_interface=hardware_interface)
 
-    # Pure collaborators. In dual-camera mode the controller's single
+    # Pure collaborators. The controller's single
     # ``camera_id`` is a fallback only; each detection carries its own camera id
     # (stamped by its pipeline), which the controller prefers when writing.
     normalizer = PlateNormalizer()
@@ -666,7 +604,7 @@ def build_application(
         load_detector_weights_or_halt(detector)
 
     # Step 7: assemble the camera pipeline(s) over the abstractions, selected
-    # purely from ``direction.mode`` (one in single-camera, two in dual-camera).
+    # purely from the configured ``cameras.*`` entries (one or two).
     camera_pipelines = build_camera_pipelines(
         config,
         detector,
@@ -795,8 +733,7 @@ def main(
     bridge = _EventBridge()
 
     # Assemble the camera pipeline(s) with the bridge-backed callbacks, selected
-    # from ``direction.mode`` (one pipeline in single-camera mode, two in
-    # dual-camera mode). Both cameras share the detector/OCR/gate/repos and emit
+    # from the configured ``cameras.*`` entries (one pipeline per camera). Cameras share the detector/OCR/gate/repos and emit
     # onto the same bridge, so the Guard_Dashboard sees a unified event stream.
     camera_pipelines = build_camera_pipelines(
         config,

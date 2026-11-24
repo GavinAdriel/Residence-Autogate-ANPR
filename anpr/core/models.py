@@ -11,7 +11,7 @@ sections) for the authoritative field definitions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -19,9 +19,6 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Primitive type aliases
 # ---------------------------------------------------------------------------
-
-# A per-frame centroid point in pixel coordinates: (x, y).
-Point = tuple[int, int]
 
 # Sentinel used in the Event_Log for numeric metrics that are unavailable.
 # Per the design data model, absent metric values are stored explicitly as the
@@ -42,11 +39,11 @@ class Classification(str, Enum):
 
 
 class DirectionOutcome(str, Enum):
-    """Direction resolution outcome.
+    """Direction outcome, derived from which camera saw the vehicle.
 
-    In this phase the single-camera resolver only ever emits INBOUND or
-    UNDETERMINED; OUTBOUND is retained for the deferred dual-camera / outbound
-    trajectory work.
+    INBOUND / OUTBOUND come from the camera configured as ``cameras.inbound`` /
+    ``cameras.outbound``. UNDETERMINED means the camera id is missing or
+    unmapped, and the event is surfaced to the guard.
     """
 
     INBOUND = "INBOUND"
@@ -140,21 +137,6 @@ class NormalizationResult:
 
 
 # ---------------------------------------------------------------------------
-# Direction value objects
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TrackHistory:
-    """Per-track motion history fed to the Direction_Resolver."""
-
-    track_id: int
-    centroids: list[Point] = field(default_factory=list)
-    camera_id: Optional[str] = None
-    confidence: float = 0.0  # 0.00..1.00
-
-
-# ---------------------------------------------------------------------------
 # Pipeline event object
 # ---------------------------------------------------------------------------
 
@@ -179,12 +161,9 @@ class DetectionEvent:
     box: Optional[BoundingBox] = None
     detection_confidence: Optional[float] = None
     track_id: Optional[int] = None
-    track: Optional[TrackHistory] = None
     # Identity of the camera that produced this detection. Stamped by the
-    # pipeline so direction can be resolved per camera (dual_camera mode) and so
-    # the correct ``ANPR_Log.Camera_ID`` (NOT NULL FK) is written per event.
-    # None in single-camera mode, where the controller's configured camera_id
-    # is used instead.
+    # pipeline so direction can be resolved from the camera and so the correct
+    # ``ANPR_Log.Camera_ID`` (NOT NULL FK) is written per event.
     camera_id: Optional[int] = None
 
     # OCR / normalization

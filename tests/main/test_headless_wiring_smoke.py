@@ -46,7 +46,7 @@ pytestmark = pytest.mark.smoke
 # can prove the repositories are built from ``database.*`` and not hardcoded
 # defaults (Req 9.1). Non-default values on every key make the check meaningful.
 _ENV = {
-    "ANPR_CAMERA__TYPE": "webcam",
+    "ANPR_CAMERAS__INBOUND__TYPE": "webcam",
     "ANPR_GATE__MODE": "simulation",
     "ANPR_DATABASE__HOST": "203.0.113.7",
     "ANPR_DATABASE__PORT": "13306",

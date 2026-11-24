@@ -36,7 +36,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("default_config.yaml")
 
 # Environment-override convention (Requirement 14.1): keys are prefixed with
 # ``ANPR_`` and use ``__`` (double underscore) as the section separator, so
-# ``ANPR_CAMERA__TARGET_FPS`` maps to the dotted key ``camera.target_fps``.
+# ``ANPR_PIPELINE__TARGET_FPS`` maps to the dotted key ``pipeline.target_fps``.
 ENV_PREFIX = "ANPR_"
 ENV_SEPARATOR = "__"
 
@@ -181,20 +181,22 @@ class ConfigProvider:
             lambda v: v in {"local-test", "field"},
             "must be one of {local-test, field}",
         )
-        # camera
+        # cameras (the key name is the direction: inbound | outbound)
+        self._validate_cameras(errors)
+        # pipeline settings shared by every camera
+        check("pipeline.target_fps", lambda v: _is_num(v) and 1 <= v <= 60, "must be between 1 and 60")
         check(
-            "camera.type",
-            lambda v: v in {"webcam", "ip"},
-            "must be one of {webcam, ip}",
-        )
-        check("camera.target_fps", lambda v: _is_num(v) and 1 <= v <= 60, "must be between 1 and 60")
-        check(
-            "camera.reconnect_interval_s",
+            "pipeline.reconnect_interval_s",
             lambda v: _is_num(v) and 1 <= v <= 60,
             "must be between 1 and 60",
         )
         check(
-            "camera.inactivity_timeout_s",
+            "pipeline.inactivity_timeout_s",
+            lambda v: _is_num(v) and 1 <= v <= 30,
+            "must be between 1 and 30",
+        )
+        check(
+            "pipeline.reconciliation_window_s",
             lambda v: _is_num(v) and 1 <= v <= 30,
             "must be between 1 and 30",
         )
@@ -284,63 +286,60 @@ class ConfigProvider:
             lambda v: isinstance(v, str),
             "must be a string",
         )
-        # direction (dual-camera-exit-correlation). `mode` is always validated;
-        # the dual_camera sub-keys are required only when that mode is selected.
-        check(
-            "direction.mode",
-            lambda v: v in {"single_camera_trajectory", "dual_camera"},
-            "must be one of {single_camera_trajectory, dual_camera}",
-        )
-        mode = self._lookup(self._data, ["direction", "mode"])
-        if mode == "dual_camera":
-            self._validate_dual_camera(errors)
-            check(
-                "direction.reconciliation_window_s",
-                lambda v: _is_num(v) and 1 <= v <= 30,
-                "must be between 1 and 30",
-            )
         return errors
 
-    def _validate_dual_camera(self, errors: "list[ConfigError]") -> None:
-        """Require a complete inbound+outbound camera config in dual_camera mode.
+    def _validate_cameras(self, errors: "list[ConfigError]") -> None:
+        """Validate ``cameras.{inbound,outbound}``; at least one side is required.
 
-        Each camera needs a valid ``type`` (webcam | ip), a non-empty
-        ``stream_url`` for ``ip``, and an integer ``id`` matching a seeded ``Camera`` row. Any gap is reported
-        naming the offending key so startup is refused (Req 1.5, 7.5).
+        The key name is the direction, so a side that is absent is simply not
+        used. Each configured side needs a valid ``type`` (webcam | ip), an
+        integer ``id`` matching a seeded ``Camera`` row, a non-empty
+        ``stream_url`` for ``ip`` and an integer ``device_index`` for ``webcam``.
+        Any gap is reported naming the offending key so startup is refused
+        (Req 1.5).
         """
-        for side in ("inbound", "outbound"):
-            base = ["direction", "cameras", side]
+        sides = [
+            side
+            for side in ("inbound", "outbound")
+            if self._lookup(self._data, ["cameras", side]) is not _MISSING
+        ]
+        cameras = self._lookup(self._data, ["cameras"])
+        if isinstance(cameras, Mapping):
+            for name in cameras:
+                if name not in ("inbound", "outbound"):
+                    errors.append(
+                        ConfigError(
+                            key=f"cameras.{name}",
+                            message="unknown camera; expected 'inbound' or 'outbound'",
+                        )
+                    )
+        if not sides:
+            errors.append(
+                ConfigError(
+                    key="cameras",
+                    message="configure at least one of 'inbound' or 'outbound'",
+                )
+            )
+            return
+
+        for side in sides:
+            base = ["cameras", side]
+            key = f"cameras.{side}"
             cam_type = self._lookup(self._data, base + ["type"])
             cam_id = self._lookup(self._data, base + ["id"])
 
             if cam_type is _MISSING:
-                errors.append(
-                    ConfigError(
-                        key=f"direction.cameras.{side}.type",
-                        message="missing required setting",
-                    )
-                )
+                errors.append(ConfigError(key=f"{key}.type", message="missing required setting"))
             elif cam_type not in {"webcam", "ip"}:
                 errors.append(
-                    ConfigError(
-                        key=f"direction.cameras.{side}.type",
-                        message="must be one of {webcam, ip}",
-                    )
+                    ConfigError(key=f"{key}.type", message="must be one of {webcam, ip}")
                 )
 
             if cam_id is _MISSING:
-                errors.append(
-                    ConfigError(
-                        key=f"direction.cameras.{side}.id",
-                        message="missing required setting",
-                    )
-                )
+                errors.append(ConfigError(key=f"{key}.id", message="missing required setting"))
             elif not (isinstance(cam_id, int) and not isinstance(cam_id, bool)):
                 errors.append(
-                    ConfigError(
-                        key=f"direction.cameras.{side}.id",
-                        message="must be an integer Camera.Camera_ID",
-                    )
+                    ConfigError(key=f"{key}.id", message="must be an integer Camera.Camera_ID")
                 )
 
             # Address requirement depends on the source type.
@@ -349,8 +348,19 @@ class ConfigProvider:
                 if not (isinstance(addr, str) and addr.strip()):
                     errors.append(
                         ConfigError(
-                            key=f"direction.cameras.{side}.stream_url",
+                            key=f"{key}.stream_url",
                             message="must be a non-empty stream URL when type is 'ip'",
+                        )
+                    )
+            elif cam_type == "webcam":
+                index = self._lookup(self._data, base + ["device_index"])
+                if index is not _MISSING and not (
+                    isinstance(index, int) and not isinstance(index, bool) and index >= 0
+                ):
+                    errors.append(
+                        ConfigError(
+                            key=f"{key}.device_index",
+                            message="must be a non-negative integer",
                         )
                     )
 
