@@ -56,6 +56,10 @@ pipeline:
   # One frame of grace absorbs a momentary single-frame tracker miss without
   # prematurely forgetting a still-present vehicle (0..600).
   track_staleness_frames: 1
+  # Extra margin added around each detection box before OCR, as a fraction of
+  # the box width/height on each side, so edge characters (e.g. the first
+  # letter of a plate) are not clipped. 0 disables padding (0..0.5).
+  crop_padding_ratio: 0.10
 
 gate:
   mode: simulation            # simulation | hardware

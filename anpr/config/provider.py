@@ -225,6 +225,11 @@ class ConfigProvider:
             lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 600,
             "must be an integer between 0 and 600",
         )
+        check(
+            "pipeline.crop_padding_ratio",
+            lambda v: _is_num(v) and 0 <= v <= 0.5,
+            "must be between 0 and 0.5",
+        )
         # gate
         check("gate.mode", lambda v: v in {"simulation", "hardware"}, "must be one of {simulation, hardware}")
         check(

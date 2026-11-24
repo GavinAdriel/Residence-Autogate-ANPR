@@ -126,6 +126,10 @@ DEFAULT_OCR_TIMEOUT_MS = 2000
 # genuine later exit (outside the window) correlates normally (Req 6.4).
 DEFAULT_RECONCILIATION_WINDOW_S = 3.0
 
+# Margin added around a detection box before OCR, as a fraction of the box size
+# per side, so edge characters are not clipped (config: pipeline.crop_padding_ratio).
+DEFAULT_CROP_PADDING_RATIO = 0.10
+
 
 # Human-readable reasons attached to events surfaced for manual handling. Kept
 # as constants so the Guard_Dashboard task and tests can match them exactly.
@@ -279,6 +283,7 @@ class DetectionPipeline:
         on_event: Optional[Callable[[DetectionEvent], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
         on_db_insert: Optional[Callable[[Any], None]] = None,
+        crop_padding_ratio: float = 0.0,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep: Callable[[float], None] = time.sleep,
@@ -332,6 +337,9 @@ class DetectionPipeline:
         self._on_event = on_event
         self._on_error = on_error
         self._on_db_insert = on_db_insert
+        # Margin (fraction of box size per side) added around the crop that is
+        # sent to OCR so edge characters are not clipped. 0 = exact box.
+        self._crop_padding_ratio = _clamp(float(crop_padding_ratio), 0.0, 0.5)
 
         self._monotonic = monotonic
         self._wall_clock = wall_clock
@@ -410,6 +418,9 @@ class DetectionPipeline:
                 config,
                 "pipeline.reconciliation_window_s",
                 DEFAULT_RECONCILIATION_WINDOW_S,
+            ),
+            crop_padding_ratio=_cfg(
+                config, "pipeline.crop_padding_ratio", DEFAULT_CROP_PADDING_RATIO
             ),
             **overrides,
         )
@@ -740,7 +751,13 @@ class DetectionPipeline:
         crop = self._crop_region(frame, detection.box)
         event.retained_crop = crop  # type: ignore[attr-defined]
 
-        ocr_result = self._ocr_invoker(self._ocr, crop, self._ocr_timeout_s)
+        # OCR reads a slightly padded region so characters at the box edge
+        # (typically the first letter) are not clipped; the retained crop stays
+        # the exact box for manual entry.
+        ocr_crop = self._crop_region(
+            frame, detection.box, padding=self._crop_padding_ratio
+        )
+        ocr_result = self._ocr_invoker(self._ocr, ocr_crop, self._ocr_timeout_s)
         event.ocr_text = ocr_result.text
         event.ocr_confidence = ocr_result.confidence
         event.ocr_timed_out = ocr_result.timed_out
@@ -1023,15 +1040,27 @@ class DetectionPipeline:
     # ------------------------------------------------------------------
     # Misc helpers
     # ------------------------------------------------------------------
-    def _crop_region(self, frame: Any, box: BoundingBox) -> Any:
+    def _crop_region(
+        self, frame: Any, box: BoundingBox, padding: float = 0.0
+    ) -> Any:
         """Crop exactly one region for a bounding box (Req 3.1).
 
         Slices the frame to ``[y1:y2, x1:x2]`` for an ``(H, W, C)`` array. On any
         slicing error (an unusual frame type) the whole frame is returned so the
         OCR engine still receives exactly one region per box rather than raising.
+
+        With ``padding`` > 0 the box grows by that fraction of its width/height
+        on every side, clamped to the frame, so edge characters are kept.
         """
         try:
-            return frame[box.y1:box.y2, box.x1:box.x2]
+            x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
+            if padding > 0:
+                pad_x = int(round((x2 - x1) * padding))
+                pad_y = int(round((y2 - y1) * padding))
+                height, width = frame.shape[:2]
+                x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+                x2, y2 = min(width, x2 + pad_x), min(height, y2 + pad_y)
+            return frame[y1:y2, x1:x2]
         except Exception:  # noqa: BLE001 - tolerate non-array frames in tests
             return frame
 
