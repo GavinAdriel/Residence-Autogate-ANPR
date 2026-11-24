@@ -434,6 +434,8 @@ def build_camera_pipelines(
     *,
     on_event: Optional[Callable[[Any], None]] = None,
     on_manual_review: Optional[Callable[[Any], None]] = None,
+    on_error: Optional[Callable[[str], None]] = None,
+    on_db_insert: Optional[Callable[[Any], None]] = None,
     detector_factory: Optional[Callable[[], Any]] = None,
 ) -> list[CameraPipeline]:
     """Build one pipeline per configured ``cameras.*`` entry.
@@ -484,6 +486,8 @@ def build_camera_pipelines(
             recent_entry_registry=registry,
             on_event=on_event,
             on_manual_review=on_manual_review,
+            on_error=on_error,
+            on_db_insert=on_db_insert,
         )
         logger.info(
             "Built %s camera pipeline (camera_id=%s).", side, camera_id
@@ -729,6 +733,8 @@ def main(
 
         detection = pyqtSignal(object)
         review = pyqtSignal(object)
+        error = pyqtSignal(str)
+        db_insert = pyqtSignal(object)
 
     bridge = _EventBridge()
 
@@ -743,6 +749,8 @@ def main(
         access_controller,
         on_event=bridge.detection.emit,
         on_manual_review=bridge.review.emit,
+        on_error=bridge.error.emit,
+        on_db_insert=bridge.db_insert.emit,
         detector_factory=lambda: _build_loaded_detector(config),
     )
     primary = next(
@@ -806,6 +814,9 @@ def main(
             ev, getattr(ev, "manual_review_reason", None)
         )
     )
+
+    bridge.error.connect(guard_dashboard.show_error)
+    bridge.db_insert.connect(guard_dashboard.show_db_insert)
 
     guard_dashboard.show()
 

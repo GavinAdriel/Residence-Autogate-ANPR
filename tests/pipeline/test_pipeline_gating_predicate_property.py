@@ -200,7 +200,8 @@ def test_pipeline_routes_to_handle_detection_iff_confident_and_valid(
         # Not confident-and-valid: never routed, always surfaced for review.
         assert access.events == []
         assert event.needs_manual_review is True
-        assert list(pipeline.manual_review_queue) == [event]
+        # Errors are reported as a message, never retained on the queue.
+        assert list(pipeline.manual_review_queue) == []
 
         # The surfacing reason matches the specific gate that rejected it, in
         # the same precedence the pipeline applies.

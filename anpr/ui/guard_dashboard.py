@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
@@ -86,7 +87,7 @@ try:  # PyQt5 is a pinned runtime dependency; guard so the module stays
     from PyQt5.QtCore import Qt, QTimer
     from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
     from PyQt5.QtWidgets import (
-        QGroupBox,
+        QFrame,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -178,6 +179,102 @@ def _cfg(config: ConfigProvider, key: str, default: Any) -> Any:
     except KeyError:
         return default
     return default if value is None else value
+
+
+def _now_hms() -> str:
+    """Return the current local time as ``HH:MM:SS`` for status messages."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Visual style helpers
+# ---------------------------------------------------------------------------
+
+# Recent-activity rows kept; a camera dot turns red after this many seconds
+# without a frame.
+_MAX_ACTIVITY = 10
+_FEED_STALE_S = 3.0
+
+# Badge / banner colours: badges are a single hex; banners are (bg, border, fg).
+_GREY = "#6b7280"
+_GREEN = "#16a34a"
+_ORANGE = "#ea580c"
+_BLUE = "#2563eb"
+_PURPLE = "#7c3aed"
+_GREY_BANNER = ("#f3f4f6", "#d1d5db", "#4b5563")
+_RED_BANNER = ("#fee2e2", "#dc2626", "#991b1b")
+_GREEN_BANNER = ("#dcfce7", "#16a34a", "#166534")
+
+_DASHBOARD_STYLE = """
+QWidget#central { background: #f3f4f6; font-family: 'Segoe UI', Arial; font-size: 13px; }
+QFrame#statusBar { background: #111827; border-radius: 6px; }
+QLabel#appTitle { color: white; font-size: 16px; font-weight: bold; }
+QLabel#barText { color: #e5e7eb; margin-right: 12px; }
+QLabel#dot { font-size: 16px; }
+QFrame#card { background: white; border-radius: 6px; }
+QFrame#panel { background: #1f2937; border-radius: 6px; }
+QLabel#panelTitle { color: #9ca3af; }
+QLabel#feed { background: #111827; color: #9ca3af; }
+QLabel#caption { color: #6b7280; font-size: 11px; font-weight: bold; }
+QLabel#plate { font-size: 34px; font-weight: bold; color: #111827; }
+QLabel#muted { color: #6b7280; }
+QLabel#badge { color: white; font-weight: bold; padding: 4px 14px; border-radius: 12px; }
+QPushButton { padding: 6px 14px; border-radius: 4px; border: 1px solid #d1d5db; background: #f9fafb; }
+QPushButton#primary { background: #16a34a; color: white; font-weight: bold; border: none; padding: 8px 18px; }
+QLineEdit { padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; }
+QListWidget { border: 1px solid #e5e7eb; border-radius: 4px; font-family: 'Segoe UI', Arial; font-size: 12px; }
+"""
+
+
+def _set_dot(dot: Any, ok: Optional[bool]) -> None:
+    """Colour a status dot: green (ok), red (down) or grey (unknown)."""
+    colour = _GREY if ok is None else (_GREEN if ok else "#dc2626")
+    dot.setStyleSheet(f"color: {colour};")
+
+
+def _set_badge(label: Any, text: str, colour: str) -> None:
+    """Set a pill badge's text and background colour."""
+    label.setText(text)
+    label.setStyleSheet(f"background: {colour};")
+
+
+def _caption(text: str, parent: Any) -> Any:
+    """Small grey caption label used as a card heading."""
+    label = QLabel(text, parent)
+    label.setObjectName("caption")
+    return label
+
+
+def _titled(title: str, content: Any, parent: Any) -> Any:
+    """Wrap ``content`` in a dark panel with a title line (live-feed panes)."""
+    frame = QFrame(parent)
+    frame.setObjectName("panel")
+    layout = QVBoxLayout(frame)
+    heading = QLabel(title, frame)
+    heading.setObjectName("panelTitle")
+    layout.addWidget(heading)
+    layout.addWidget(content, 1)
+    return frame
+
+
+def _outcome_text(event: DetectionEvent) -> str:
+    """One-line outcome for a classified detection."""
+    if getattr(event, "is_exit_anomaly", False):
+        return "Exit without entry ticket - guard decision needed"
+    if event.classification is Classification.RESIDENT:
+        return "Resident matched - gate open requested"
+    if event.classification is Classification.GUEST:
+        return "Guest - waiting for guard"
+    return ""
+
+
+def _direction_style(direction: Optional[DirectionOutcome]) -> tuple[str, str]:
+    """Return ``(text, colour)`` for the direction badge."""
+    if direction is DirectionOutcome.INBOUND:
+        return "INBOUND", _BLUE
+    if direction is DirectionOutcome.OUTBOUND:
+        return "OUTBOUND", _PURPLE
+    return "DIRECTION ?", _GREY
 
 
 def _now_iso() -> str:
@@ -585,6 +682,10 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         self._current_guest_event: Optional[DetectionEvent] = None
         self._guard_edited_plate: bool = False
 
+        # De-duplication state for the error banner and activity list.
+        self._last_error_message: Optional[str] = None
+        self._activity_keys: "deque[tuple]" = deque(maxlen=50)
+
         # Last action outcome, retained for tests and status display.
         self.last_grant_result: Optional[ManualGrantResult] = None
 
@@ -615,88 +716,203 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
     # Layout construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        """Assemble the three-panel layout (left feed, top/bottom right)."""
+        """Assemble the dashboard: status bar, live feeds, and info cards."""
         central = QWidget(self)
-        root = QHBoxLayout(central)
+        central.setObjectName("central")
+        central.setStyleSheet(_DASHBOARD_STYLE)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(10)
 
-        # --- Left panel: live feed with overlays (Req 12.1) ----------------
+        # --- Top status bar: title + camera / DB health dots ---------------
+        bar = QFrame(central)
+        bar.setObjectName("statusBar")
+        bar_layout = QHBoxLayout(bar)
+        title = QLabel("ANPR Autogate", bar)
+        title.setObjectName("appTitle")
+        bar_layout.addWidget(title)
+        bar_layout.addStretch(1)
+
+        self._cam_dots: list[Any] = []
+        camera_titles = [self._primary_feed_title] + [t for t, _ in self._extra_feeds]
+        for cam_title in camera_titles:
+            dot = QLabel("\u25CF", bar)
+            dot.setObjectName("dot")
+            text = QLabel(cam_title.replace("Live Feed", "Camera").replace(" - ", ": "), bar)
+            text.setObjectName("barText")
+            bar_layout.addWidget(dot)
+            bar_layout.addWidget(text)
+            self._cam_dots.append(dot)
+        self._db_dot = QLabel("\u25CF", bar)
+        self._db_dot.setObjectName("dot")
+        db_text = QLabel("DB", bar)
+        db_text.setObjectName("barText")
+        bar_layout.addWidget(self._db_dot)
+        bar_layout.addWidget(db_text)
+        outer.addWidget(bar)
+        for dot in self._cam_dots + [self._db_dot]:
+            _set_dot(dot, None)
+        self._feed_last_seen: list[Optional[float]] = [None] * len(self._cam_dots)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        outer.addLayout(body, 1)
+
+        # --- Left: live feeds ----------------------------------------------
         feed_column = QVBoxLayout()
         multi = bool(self._extra_feeds)
-        min_size = (400, 300) if multi else (480, 360)
+        min_size = (400, 260) if multi else (480, 360)
 
-        left_panel = QGroupBox(self._primary_feed_title, central)
-        left_layout = QVBoxLayout(left_panel)
-        self._feed_label = QLabel("No feed", left_panel)
+        self._feed_label = QLabel("No feed", central)
+        self._feed_label.setObjectName("feed")
         self._feed_label.setAlignment(Qt.AlignCenter)
         self._feed_label.setMinimumSize(*min_size)
         self._feed_label.setScaledContents(False)
-        left_layout.addWidget(self._feed_label)
-        feed_column.addWidget(left_panel, 1)
+        feed_column.addWidget(_titled(self._primary_feed_title, self._feed_label, central), 1)
 
-        for title, _provider in self._extra_feeds:
-            extra_panel = QGroupBox(title, central)
-            extra_layout = QVBoxLayout(extra_panel)
-            extra_label = QLabel("No feed", extra_panel)
+        for extra_title, _provider in self._extra_feeds:
+            extra_label = QLabel("No feed", central)
+            extra_label.setObjectName("feed")
             extra_label.setAlignment(Qt.AlignCenter)
             extra_label.setMinimumSize(*min_size)
             extra_label.setScaledContents(False)
-            extra_layout.addWidget(extra_label)
             self._extra_feed_labels.append(extra_label)
-            feed_column.addWidget(extra_panel, 1)
-        root.addLayout(feed_column, 2)
+            feed_column.addWidget(_titled(extra_title, extra_label, central), 1)
+        body.addLayout(feed_column, 2)
 
-        # --- Right column: split into top-right and bottom-right -----------
-        right_column = QVBoxLayout()
+        # --- Right column: cards -------------------------------------------
+        right = QVBoxLayout()
+        right.setSpacing(10)
 
-        # Top-right: latest detection summary (Req 12.2).
-        detection_panel = QGroupBox("Latest Detection", central)
-        detection_layout = QVBoxLayout(detection_panel)
-        self._plate_value = QLabel("Plate: -", detection_panel)
-        self._tag_value = QLabel("Tag: -", detection_panel)
-        self._timestamp_value = QLabel("Time: -", detection_panel)
-        detection_layout.addWidget(self._plate_value)
-        detection_layout.addWidget(self._tag_value)
-        detection_layout.addWidget(self._timestamp_value)
-        right_column.addWidget(detection_panel, 1)
+        # Current vehicle card (Req 12.2).
+        vehicle = QFrame(central)
+        vehicle.setObjectName("card")
+        v_layout = QVBoxLayout(vehicle)
+        v_layout.addWidget(_caption("CURRENT VEHICLE", vehicle))
+        self._plate_value = QLabel("-", vehicle)
+        self._plate_value.setObjectName("plate")
+        v_layout.addWidget(self._plate_value)
+        badges = QHBoxLayout()
+        self._tag_value = QLabel("-", vehicle)
+        self._direction_value = QLabel("-", vehicle)
+        for badge in (self._tag_value, self._direction_value):
+            badge.setObjectName("badge")
+            badge.setAlignment(Qt.AlignCenter)
+            badges.addWidget(badge)
+        badges.addStretch(1)
+        _set_badge(self._tag_value, "-", _GREY)
+        _set_badge(self._direction_value, "-", _GREY)
+        v_layout.addLayout(badges)
+        self._timestamp_value = QLabel("Time: -", vehicle)
+        self._timestamp_value.setObjectName("muted")
+        v_layout.addWidget(self._timestamp_value)
+        self._outcome_value = QLabel("Waiting for a vehicle...", vehicle)
+        self._outcome_value.setObjectName("muted")
+        self._outcome_value.setWordWrap(True)
+        v_layout.addWidget(self._outcome_value)
+        right.addWidget(vehicle)
 
-        # Bottom-right: manual controls + manual-review queue (Req 12.3, 12.7).
-        control_panel = QGroupBox("Manual Control", central)
-        control_layout = QVBoxLayout(control_panel)
+        # Current error banner (replaced on each new error, not a list).
+        self._error_label = QLabel("", central)
+        self._error_label.setWordWrap(True)
+        self._error_label.setObjectName("banner")
+        right.addWidget(self._error_label)
+        self.clear_error()
 
-        self._plate_input = QLineEdit(control_panel)
-        self._plate_input.setPlaceholderText("Enter plate for manual grant")
+        # Latest DB insert banner.
+        self._db_label = QLabel("", central)
+        self._db_label.setWordWrap(True)
+        self._db_label.setObjectName("banner")
+        right.addWidget(self._db_label)
+        self._set_banner(self._db_label, "NO DB INSERTS YET", "", _GREY_BANNER)
+
+        # Guest / manual control card (Req 12.3-12.7).
+        control = QFrame(central)
+        control.setObjectName("card")
+        c_layout = QVBoxLayout(control)
+        c_layout.addWidget(_caption("GUEST / MANUAL CONTROL", control))
+
+        row = QHBoxLayout()
+        self._plate_input = QLineEdit(control)
+        self._plate_input.setPlaceholderText("Plate (auto-filled for a guest, editable)")
         # Req 12.3: accept up to the configured maximum character length.
         self._plate_input.setMaxLength(self._guard_config.manual_plate_max_len)
         # ``textEdited`` fires only on user keystrokes (not programmatic
-        # ``setText``), so it marks when the guard has started correcting the
-        # plate. While edited, auto-fill from a new detection frame is
-        # suppressed so an in-progress correction is never clobbered.
+        # ``setText``) so an in-progress correction is never clobbered.
         self._plate_input.textEdited.connect(self._on_plate_text_edited)
-        control_layout.addWidget(self._plate_input)
-
-        self._open_gate_button = QPushButton("Open Gate", control_panel)
+        row.addWidget(self._plate_input, 1)
+        self._open_gate_button = QPushButton("Open Gate", control)
+        self._open_gate_button.setObjectName("primary")
         self._open_gate_button.clicked.connect(self._on_open_gate_clicked)
-        control_layout.addWidget(self._open_gate_button)
+        row.addWidget(self._open_gate_button)
+        c_layout.addLayout(row)
 
-        self._status_label = QLabel("", control_panel)
+        self._status_label = QLabel("", control)
         self._status_label.setWordWrap(True)
-        control_layout.addWidget(self._status_label)
+        c_layout.addWidget(self._status_label)
 
-        control_layout.addWidget(QLabel("Manual-review queue:", control_panel))
-        self._review_list = QListWidget(control_panel)
-        # Selecting a surfaced guest pre-fills the manual plate input with its
-        # best-read plate so the guard can permit it without retyping (Req 12.3).
+        c_layout.addWidget(_caption("Guest / exit-anomaly queue", control))
+        self._review_list = QListWidget(control)
+        self._review_list.setMaximumHeight(90)
+        self._review_list.setWordWrap(True)
+        self._review_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Selecting a surfaced guest pre-fills the manual plate input (Req 12.3).
         self._review_list.currentItemChanged.connect(self._on_review_selection_changed)
-        control_layout.addWidget(self._review_list, 1)
-
-        self._resolve_button = QPushButton("Resolve selected", control_panel)
+        c_layout.addWidget(self._review_list)
+        self._resolve_button = QPushButton("Resolve selected", control)
         self._resolve_button.clicked.connect(self._on_resolve_clicked)
-        control_layout.addWidget(self._resolve_button)
+        c_layout.addWidget(self._resolve_button)
+        right.addWidget(control)
 
-        right_column.addWidget(control_panel, 2)
-        root.addLayout(right_column, 1)
+        # Recent activity (in-memory history, newest first).
+        activity = QFrame(central)
+        activity.setObjectName("card")
+        a_layout = QVBoxLayout(activity)
+        a_layout.addWidget(_caption("RECENT ACTIVITY", activity))
+        self._activity_list = QListWidget(activity)
+        self._activity_list.setObjectName("activity")
+        self._activity_list.setWordWrap(True)
+        self._activity_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        a_layout.addWidget(self._activity_list)
+        right.addWidget(activity, 1)
 
+        body.addLayout(right, 1)
         self.setCentralWidget(central)
+
+    # ------------------------------------------------------------------
+    # Banners, status dots and recent activity
+    # ------------------------------------------------------------------
+    def _set_banner(self, label: Any, head: str, detail: str, colors: tuple) -> None:
+        """Style a banner label and set its heading + detail text."""
+        bg, border, fg = colors
+        label.setStyleSheet(
+            f"background:{bg}; border:1px solid {border}; color:{fg}; "
+            "border-radius:6px; padding:8px;"
+        )
+        label.setText(f"<b>{head}</b><br>{detail}" if detail else f"<b>{head}</b>")
+
+    def _add_activity(self, text: str, *, error: bool = False) -> None:
+        """Prepend a line to the recent-activity list (capped, newest first)."""
+        item = QListWidgetItem(f"{_now_hms()}   {text}")
+        if error:
+            item.setForeground(QColor("#b91c1c"))
+        self._activity_list.insertItem(0, item)
+        while self._activity_list.count() > _MAX_ACTIVITY:
+            self._activity_list.takeItem(self._activity_list.count() - 1)
+
+    def _note_feed(self, index: int, alive: bool) -> None:
+        """Record camera liveness and refresh its status dot."""
+        if index >= len(self._cam_dots):
+            return
+        now = time.monotonic()
+        if alive:
+            self._feed_last_seen[index] = now
+        last = self._feed_last_seen[index]
+        if last is None:
+            _set_dot(self._cam_dots[index], None)
+        else:
+            _set_dot(self._cam_dots[index], (now - last) <= _FEED_STALE_S)
+
 
     # ------------------------------------------------------------------
     # Live feed (Req 12.1)
@@ -714,17 +930,23 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         """Timer slot: pull the latest frame + detections and render them."""
         # Extra feeds first: they render only and never touch the frame retained
         # for manual-grant capture.
-        for (title, provider), label in zip(self._extra_feeds, self._extra_feed_labels):
+        for index, ((title, provider), label) in enumerate(
+            zip(self._extra_feeds, self._extra_feed_labels), start=1
+        ):
             try:
                 extra_payload = provider()
             except Exception as exc:  # noqa: BLE001 - must not crash the UI
                 logger.error("Live-feed provider for %r failed: %s", title, exc)
+                self._note_feed(index, False)
                 continue
             if extra_payload is None:
+                self._note_feed(index, False)
                 continue
             extra_frame, extra_detections = extra_payload
             if extra_frame is None:
+                self._note_feed(index, False)
                 continue
+            self._note_feed(index, True)
             pixmap = self._frame_to_pixmap(extra_frame, list(extra_detections or []))
             if pixmap is not None:
                 label.setPixmap(
@@ -739,9 +961,12 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
             payload = self._frame_provider()
         except Exception as exc:  # noqa: BLE001 - a provider fault must not crash the UI
             logger.error("Live-feed frame provider failed: %s", exc)
+            self._note_feed(0, False)
             return
-        if payload is None:
+        if payload is None or payload[0] is None:
+            self._note_feed(0, False)
             return
+        self._note_feed(0, True)
         frame, detections = payload
         self.render_frame(frame, detections or [])
 
@@ -843,11 +1068,26 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         started = time.monotonic()
 
         plate = event.normalized_plate or event.ocr_text or "-"
-        self._plate_value.setText(f"Plate: {plate}")
-        self._tag_value.setText(f"Tag: {_classification_tag(event.classification)}")
+        self._plate_value.setText(plate)
+        tag_colour = {
+            Classification.RESIDENT: _GREEN,
+            Classification.GUEST: _ORANGE,
+        }.get(event.classification, _GREY)
+        _set_badge(
+            self._tag_value, _classification_tag(event.classification).upper(), tag_colour
+        )
+        dir_text, dir_colour = _direction_style(event.direction)
+        _set_badge(self._direction_value, dir_text, dir_colour)
         self._timestamp_value.setText(f"Time: {_format_timestamp(event.timestamp)}")
 
         self._update_guest_autofill(event)
+
+        # A vehicle that was classified (resident/guest) means the pipeline is
+        # working again, so the previous error no longer applies.
+        if event.classification is not None:
+            self.clear_error()
+            self._outcome_value.setText(_outcome_text(event))
+            self._log_detection_activity(event, plate)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if elapsed_ms > self._guard_config.max_update_latency_ms:
@@ -856,6 +1096,60 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
                 elapsed_ms,
                 self._guard_config.max_update_latency_ms,
             )
+
+    # ------------------------------------------------------------------
+    # Current-error and DB-insert messages
+    # ------------------------------------------------------------------
+    def show_error(self, message: str) -> None:
+        """Show ``message`` as the current error (replaces any previous one)."""
+        self._set_banner(
+            self._error_label, f"ERROR {_now_hms()}", message, _RED_BANNER
+        )
+        # Repeated identical errors (e.g. a camera retry loop) update the banner
+        # but are not re-added to the activity list.
+        if message != self._last_error_message:
+            self._last_error_message = message
+            self._add_activity(f"ERROR  {message}", error=True)
+        lowered = message.lower()
+        if "db" in lowered or "lookup" in lowered or "insert" in lowered:
+            _set_dot(self._db_dot, False)
+
+    def clear_error(self) -> None:
+        """Clear the current-error message."""
+        self._last_error_message = None
+        self._set_banner(self._error_label, "NO ERRORS", "", _GREY_BANNER)
+
+    def show_db_insert(self, record: Any) -> None:
+        """Show a clear confirmation that a row was inserted into the DB."""
+        kind = getattr(getattr(record, "event_kind", None), "value", None)
+        direction = getattr(getattr(record, "direction", None), "value", None)
+        classification = getattr(getattr(record, "classification", None), "value", None)
+        parts = [
+            f"Log #{getattr(record, 'log_id', None)}",
+            getattr(record, "normalized_plate", "") or "-",
+        ]
+        parts.extend(v for v in (classification, direction, kind) if v)
+        self._set_banner(
+            self._db_label,
+            f"SAVED TO DB {_now_hms()}",
+            " - ".join(str(p) for p in parts),
+            _GREEN_BANNER,
+        )
+        _set_dot(self._db_dot, True)
+
+    def _log_detection_activity(self, event: DetectionEvent, plate: str) -> None:
+        """Add one activity line per vehicle track (not per frame)."""
+        key = (event.camera_id, event.track_id, event.classification)
+        if event.track_id is not None:
+            if key in self._activity_keys:
+                return
+            self._activity_keys.append(key)
+        direction = getattr(event.direction, "value", None)
+        parts = [plate, _classification_tag(event.classification)]
+        if direction:
+            parts.append(direction)
+        parts.append(_outcome_text(event))
+        self._add_activity("   ".join(parts))
 
     def _update_guest_autofill(self, event: DetectionEvent) -> None:
         """Keep the plate input tracking the current guest's best read.
@@ -1017,12 +1311,17 @@ class GuardDashboard(QMainWindow):  # type: ignore[misc,valid-type]
         if not result.gate_success:
             # Req 12.6: error identifying the failed action; not marked granted.
             self._status_label.setText(f"ERROR: Open Gate failed. {result.detail}")
+            self.show_error(f"Open Gate failed. {result.detail}")
         elif not result.recorded:
             self._status_label.setText(f"ERROR: {result.detail}")
+            self.show_error(result.detail)
         else:
+            if result.record is not None:
+                self.show_db_insert(result.record)
             granted_plate = result.record.normalized_plate if result.record else ""
             suffix = f" (plate {granted_plate})" if granted_plate else ""
             self._status_label.setText(f"Gate opened; manual grant recorded{suffix}.")
+            self._add_activity(f"{granted_plate or '-'}   Granted by guard")
             record = result.record
             if (
                 self._on_guest_entry is not None

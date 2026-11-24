@@ -244,6 +244,14 @@ class DetectionPipeline:
     on_event:
         Optional callback invoked with every fully assembled
         :class:`DetectionEvent` (surfaced or routed) for the live feed.
+    on_error:
+        Optional callback invoked with a one-line message describing the
+        *current* error (OCR failure, low confidence, invalid plate, DB fault,
+        camera/connection fault). Errors are reported only; they are not queued
+        for manual review.
+    on_db_insert:
+        Optional callback invoked with the inserted ``EventRecord`` after the
+        access controller writes a row to the event log.
     monotonic, wall_clock, sleep, ocr_invoker:
         Injectable time / sleep / OCR-timeout seams for deterministic testing.
     """
@@ -269,6 +277,8 @@ class DetectionPipeline:
         recent_entry_registry: Optional[RecentEntryRegistry] = None,
         on_manual_review: Optional[Callable[[DetectionEvent], None]] = None,
         on_event: Optional[Callable[[DetectionEvent], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+        on_db_insert: Optional[Callable[[Any], None]] = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep: Callable[[float], None] = time.sleep,
@@ -320,6 +330,8 @@ class DetectionPipeline:
 
         self._on_manual_review = on_manual_review
         self._on_event = on_event
+        self._on_error = on_error
+        self._on_db_insert = on_db_insert
 
         self._monotonic = monotonic
         self._wall_clock = wall_clock
@@ -523,6 +535,7 @@ class DetectionPipeline:
                 self._descriptor(),
                 exc,
             )
+            self._report_error(f"Camera read failed ({self._descriptor()}): {exc}")
             self._handle_disconnect("read fault")
             return []
 
@@ -550,6 +563,9 @@ class DetectionPipeline:
             try:
                 self._source.open()
             except SourceUnavailable as exc:
+                self._report_error(
+                    f"Camera unavailable ({self._descriptor()}): {exc}"
+                )
                 logger.error(
                     "Failed to open video source '%s'; retrying in %.0f s: %s",
                     self._descriptor(),
@@ -559,6 +575,9 @@ class DetectionPipeline:
                 self._sleep(self._reconnect_interval_s)
                 continue
             except Exception as exc:  # noqa: BLE001 - any open fault is unavailability
+                self._report_error(
+                    f"Camera unavailable ({self._descriptor()}): {exc}"
+                )
                 logger.error(
                     "Unexpected error opening video source '%s'; retrying in "
                     "%.0f s: %s",
@@ -597,6 +616,8 @@ class DetectionPipeline:
         The next :meth:`run_once` will re-enter :meth:`_ensure_connected` and
         reconnect at the configured interval (Req 1.5, 1.6).
         """
+        if reason != "read fault":  # a read fault was already reported
+            self._report_error(f"Camera interrupted ({self._descriptor()}): {reason}")
         logger.error(
             "Video source '%s' interrupted (%s); will reconnect in %.0f s.",
             self._descriptor(),
@@ -634,7 +655,11 @@ class DetectionPipeline:
         detection with accumulated confidences and end-to-end latency. An empty
         frame yields no events (Req 2.3).
         """
-        detections = self._detector.detect(frame)
+        try:
+            detections = self._detector.detect(frame)
+        except Exception as exc:  # noqa: BLE001 - report, keep the thread alive
+            self._report_error(f"Vehicle detection failed: {exc}")
+            return []
 
         # Publish the frame + detections for the live feed on every processed
         # frame (even with no detections) so the Guard_Dashboard shows a
@@ -645,7 +670,11 @@ class DetectionPipeline:
 
         events: list[DetectionEvent] = []
         for detection in detections:
-            processed = self._process_detection(frame, detection, acquired_at)
+            try:
+                processed = self._process_detection(frame, detection, acquired_at)
+            except Exception as exc:  # noqa: BLE001 - e.g. DB insert failure
+                self._report_error(f"DB insert / processing failed: {exc}")
+                continue
             # A resolved track is skipped before OCR and yields no event.
             if processed is not None:
                 events.append(processed)
@@ -878,16 +907,39 @@ class DetectionPipeline:
         self._finalize_latency(event, acquired_at)
         event.needs_manual_review = True
         event.manual_review_reason = reason
-        self.manual_review_queue.append(event)
-        if self._on_manual_review is not None:
-            self._on_manual_review(event)
-        logger.info(
-            "Surfaced detection for manual handling (plate=%r): %s",
-            event.normalized_plate or event.ocr_text,
-            reason,
-        )
+        # Read errors are reported as the current error message only; they are
+        # not retained on the manual-review queue.
+        self._report_error(reason, event)
         self._emit(event)
         return event
+
+    def _report_error(
+        self, message: str, event: Optional[DetectionEvent] = None
+    ) -> None:
+        """Log and report the current error to the optional ``on_error`` sink."""
+        plate = (event.normalized_plate or event.ocr_text) if event is not None else None
+        text = f"{message} (plate: {plate})" if plate else message
+        logger.error("Current error: %s", text)
+        if self._on_error is not None:
+            try:
+                self._on_error(text)
+            except Exception:  # noqa: BLE001 - a sink fault must not stop the pipeline
+                logger.debug("on_error callback failed.", exc_info=True)
+
+    def _report_db_insert(self, record: Any) -> None:
+        """Notify the optional ``on_db_insert`` sink that a row was inserted."""
+        logger.info(
+            "DB insert OK: Log_ID=%s plate=%r classification=%s direction=%s",
+            getattr(record, "log_id", None),
+            getattr(record, "normalized_plate", ""),
+            getattr(getattr(record, "classification", None), "value", None),
+            getattr(getattr(record, "direction", None), "value", None),
+        )
+        if self._on_db_insert is not None:
+            try:
+                self._on_db_insert(record)
+            except Exception:  # noqa: BLE001 - a sink fault must not stop the pipeline
+                logger.debug("on_db_insert callback failed.", exc_info=True)
 
     def _apply_decision(self, event: DetectionEvent, decision: Any) -> None:
         """Reflect an ``AccessDecision`` onto the event's review flags.
@@ -902,11 +954,22 @@ class DetectionPipeline:
         here as before.
         """
         event.classification = decision.classification
+        # A row written by the access controller is reported as a DB insert.
+        if getattr(decision, "event_record", None) is not None:
+            self._report_db_insert(decision.event_record)
         # Carry the Exit_Anomaly marker onto the event so the Guard_Dashboard can
         # label it distinctly and record a permit as an EXIT (Req 5.3, 5.4),
         # regardless of which surfacing path runs below.
         event.is_exit_anomaly = bool(getattr(decision, "is_exit_anomaly", False))
         if not getattr(decision, "surfaced_to_guard", False):
+            return
+
+        # System faults (e.g. DB lookup failure) are reported as the current
+        # error, not queued for manual review.
+        if getattr(decision, "is_error", False):
+            event.needs_manual_review = True
+            event.manual_review_reason = decision.reason
+            self._report_error(decision.reason or "Unknown error", event)
             return
 
         # A tracked guest's surfacing is deduplicated per track elsewhere.

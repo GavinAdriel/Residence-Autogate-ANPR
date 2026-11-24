@@ -225,6 +225,10 @@ class AccessDecision:
     # (dual-camera-exit-correlation Req 5.3). Lets the Guard_Dashboard present a
     # "leaving without a ticket" anomaly distinctly from a normal guest entry.
     is_exit_anomaly: bool = False
+    # True when the decision was caused by a system fault (e.g. a DB lookup
+    # failure). Such faults are reported as a current-error message instead of
+    # being queued for manual review.
+    is_error: bool = False
 
 
 @dataclass(frozen=True)

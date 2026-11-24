@@ -226,9 +226,8 @@ class AccessController:
             decision.grant_method = GrantMethod.NONE
             decision.gate_requested = False  # no gate (Req 4.6)
             decision.surfaced_to_guard = True  # surface (Req 4.6)
-            decision.reason = (
-                "Resident lookup failed; surfaced for manual decision."
-            )
+            decision.is_error = True
+            decision.reason = f"Resident lookup failed: {exc}"
             # Exactly one record for the detection (Req 4.7). No resident is
             # known, so Vehicle_ID is written as NULL.
             self._append_record(ev, normalized_plate, decision, None, direction)
@@ -329,9 +328,8 @@ class AccessController:
             decision.grant_method = GrantMethod.NONE
             decision.gate_requested = False
             decision.surfaced_to_guard = True
-            decision.reason = (
-                "Exit open-entry lookup failed; surfaced for manual decision."
-            )
+            decision.is_error = True
+            decision.reason = f"Exit open-entry lookup failed: {exc}"
             return decision
 
         if open_entry is None:

@@ -415,7 +415,8 @@ def test_ocr_no_text_surfaces_for_manual_entry_and_retains_crop():
 
     assert event.needs_manual_review is True
     assert event.manual_review_reason == REVIEW_OCR_NO_TEXT
-    assert list(pipeline.manual_review_queue) == [event]
+    # OCR errors are reported as a message, not retained on the queue.
+    assert list(pipeline.manual_review_queue) == []
     # Surfaced without ever reaching the access controller (Req 7.2/7.3).
     assert access.detection_events == []
     # Crop retained on the event for manual entry (Req 3.3).
@@ -617,15 +618,18 @@ def test_processing_latency_is_decision_minus_acquisition():
 
 
 @pytest.mark.unit
-def test_on_manual_review_callback_is_invoked():
+def test_ocr_error_invokes_on_error_not_manual_review():
     detection = Detection(box=BoundingBox(0, 0, 20, 10), confidence=0.9, track_id=1)
     ocr = FakeOcr(OcrResult(text=None, confidence=0.0))
-    seen: list = []
+    errors: list = []
+    reviewed: list = []
     pipeline, *_ = make_pipeline(
         detector=FakeDetector([detection]),
         ocr=ocr,
-        on_manual_review=seen.append,
+        on_manual_review=reviewed.append,
+        on_error=errors.append,
     )
 
-    [event] = pipeline.process_frame(a_frame(), acquired_at=0.0)
-    assert seen == [event]
+    pipeline.process_frame(a_frame(), acquired_at=0.0)
+    assert errors == [REVIEW_OCR_NO_TEXT]
+    assert reviewed == []
