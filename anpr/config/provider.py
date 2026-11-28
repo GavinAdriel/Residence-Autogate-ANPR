@@ -230,6 +230,11 @@ class ConfigProvider:
             lambda v: _is_num(v) and 0 <= v <= 0.5,
             "must be between 0 and 0.5",
         )
+        check(
+            "pipeline.ocr_min_y_ratio",
+            lambda v: _is_num(v) and 0 <= v <= 1,
+            "must be between 0 and 1",
+        )
         # gate
         check("gate.mode", lambda v: v in {"simulation", "hardware"}, "must be one of {simulation, hardware}")
         check(

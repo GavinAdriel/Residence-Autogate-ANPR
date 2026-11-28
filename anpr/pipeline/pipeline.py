@@ -130,6 +130,11 @@ DEFAULT_RECONCILIATION_WINDOW_S = 3.0
 # per side, so edge characters are not clipped (config: pipeline.crop_padding_ratio).
 DEFAULT_CROP_PADDING_RATIO = 0.10
 
+# OCR trigger line as a fraction of frame height (config:
+# pipeline.ocr_min_y_ratio). OCR only runs once a vehicle's box centre is at or
+# below this line; 0 disables the gate (OCR on every detection).
+DEFAULT_OCR_MIN_Y_RATIO = 0.0
+
 
 # Human-readable reasons attached to events surfaced for manual handling. Kept
 # as constants so the Guard_Dashboard task and tests can match them exactly.
@@ -284,6 +289,7 @@ class DetectionPipeline:
         on_error: Optional[Callable[[str], None]] = None,
         on_db_insert: Optional[Callable[[Any], None]] = None,
         crop_padding_ratio: float = 0.0,
+        ocr_min_y_ratio: float = DEFAULT_OCR_MIN_Y_RATIO,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep: Callable[[float], None] = time.sleep,
@@ -340,6 +346,9 @@ class DetectionPipeline:
         # Margin (fraction of box size per side) added around the crop that is
         # sent to OCR so edge characters are not clipped. 0 = exact box.
         self._crop_padding_ratio = _clamp(float(crop_padding_ratio), 0.0, 0.5)
+        # OCR trigger line (fraction of frame height). A detection whose box
+        # centre is above this line is skipped before cropping/OCR.
+        self._ocr_min_y_ratio = _clamp(float(ocr_min_y_ratio), 0.0, 1.0)
 
         self._monotonic = monotonic
         self._wall_clock = wall_clock
@@ -421,6 +430,9 @@ class DetectionPipeline:
             ),
             crop_padding_ratio=_cfg(
                 config, "pipeline.crop_padding_ratio", DEFAULT_CROP_PADDING_RATIO
+            ),
+            ocr_min_y_ratio=_cfg(
+                config, "pipeline.ocr_min_y_ratio", DEFAULT_OCR_MIN_Y_RATIO
             ),
             **overrides,
         )
@@ -735,6 +747,12 @@ class DetectionPipeline:
             # Register the track as seen this frame so it is not evicted while
             # still in view, even across frames that surface for manual review.
             self._tracks.touch(track_id)
+
+        # OCR trigger line: a vehicle still above the line is not read yet, so no
+        # crop/OCR work is spent on it. The track stays registered (touched
+        # above) and is read once it crosses the line.
+        if not self._below_ocr_line(frame, detection.box):
+            return None
 
         event = DetectionEvent(
             timestamp=self._wall_clock(),
@@ -1063,6 +1081,21 @@ class DetectionPipeline:
             return frame[y1:y2, x1:x2]
         except Exception:  # noqa: BLE001 - tolerate non-array frames in tests
             return frame
+
+    def _below_ocr_line(self, frame: Any, box: BoundingBox) -> bool:
+        """Return whether the box centre is at/below the OCR trigger line.
+
+        Always ``True`` when the gate is disabled (ratio 0) or the frame height
+        cannot be determined, so a gate problem never blocks OCR.
+        """
+        if self._ocr_min_y_ratio <= 0:
+            return True
+        try:
+            height = frame.shape[0]
+        except Exception:  # noqa: BLE001 - non-array frame: do not gate
+            return True
+        centre_y = (box.y1 + box.y2) / 2
+        return centre_y >= self._ocr_min_y_ratio * height
 
     def _descriptor(self) -> str:
         """Return the source descriptor for logs, tolerating its absence."""

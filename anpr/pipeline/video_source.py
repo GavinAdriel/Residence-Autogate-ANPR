@@ -37,6 +37,9 @@ pattern used by the detector and OCR wrappers. See
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -68,9 +71,21 @@ def _default_capture_factory(source: Any) -> Any:
     dependency is installed (matching the guarded-import pattern used by the
     detector and OCR wrappers).
     """
+    if isinstance(source, str):
+        # Network streams: prefer RTSP over TCP (avoids UDP packet-loss
+        # artifacts). Must be set before cv2 opens the stream; an explicit user
+        # setting is left untouched.
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
     import cv2  # local import: heavy optional dependency
 
-    return cv2.VideoCapture(source)
+    capture = cv2.VideoCapture(source)
+    if isinstance(source, str):
+        try:
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # best effort; backend may ignore
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not set capture buffer size.", exc_info=True)
+    return capture
 
 
 class _OpenCvVideoSource:
@@ -206,6 +221,13 @@ class IpCameraVideoSource(_OpenCvVideoSource):
         Configuration_Provider (``camera.stream_url``).
     capture_factory:
         Injectable capture factory (see :class:`_OpenCvVideoSource`).
+    latest_frame_only:
+        When ``True`` (default) a background thread drains the stream
+        continuously and :meth:`read` returns only the newest frame, each frame
+        at most once. This keeps a slow consumer (detector + OCR) from falling
+        behind the live stream through OpenCV's internal buffer, at the cost of
+        dropping frames it cannot keep up with. When ``False`` frames are read
+        synchronously, one per :meth:`read` call.
     """
 
     def __init__(
@@ -213,9 +235,65 @@ class IpCameraVideoSource(_OpenCvVideoSource):
         stream_url: str,
         *,
         capture_factory: CaptureFactory = _default_capture_factory,
+        latest_frame_only: bool = True,
     ) -> None:
         super().__init__(stream_url, capture_factory=capture_factory)
         self._stream_url = stream_url
+        self._latest_frame_only = latest_frame_only
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+        self._latest: Optional[Any] = None  # newest frame not yet returned
+
+    def open(self) -> None:
+        """Open the stream and, in latest-frame mode, start the reader thread."""
+        super().open()
+        if not self._latest_frame_only:
+            return
+        with self._lock:
+            self._latest = None
+        self._stop_event.clear()
+        self._reader = threading.Thread(
+            target=self._reader_loop,
+            args=(self._capture,),
+            name=f"video-reader[{self.descriptor}]",
+            daemon=True,
+        )
+        self._reader.start()
+
+    def read(self) -> Optional[Any]:
+        """Return the newest unseen frame, or ``None`` when there is none yet."""
+        if not self._latest_frame_only:
+            return super().read()
+        with self._lock:
+            frame, self._latest = self._latest, None
+        return frame
+
+    def close(self) -> None:
+        """Stop the reader thread (if any) before releasing the capture."""
+        self._stop_event.set()
+        reader, self._reader = self._reader, None
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2.0)
+        with self._lock:
+            self._latest = None
+        super().close()
+
+    def _reader_loop(self, capture: Any) -> None:
+        """Continuously read frames, keeping only the newest one."""
+        while not self._stop_event.is_set():
+            try:
+                ok, frame = capture.read()
+            except Exception:  # noqa: BLE001 - a read fault ends the reader
+                logger.exception("Reader thread for '%s' failed.", self.descriptor)
+                return
+            if not ok or frame is None:
+                # No frame: back off briefly. The pipeline's inactivity
+                # watchdog sees the missing frames and reconnects.
+                time.sleep(0.02)
+                continue
+            with self._lock:
+                self._latest = frame
 
     @property
     def stream_url(self) -> str:

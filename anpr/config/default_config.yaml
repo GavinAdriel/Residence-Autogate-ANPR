@@ -24,14 +24,14 @@ environment:
 cameras:
   inbound:
     id: 1
-    type: webcam
+    type: ip
     device_index: 0
-    stream_url: ""
+    stream_url: "rtsp://bot_pos3:tes_12345@169.254.50.157:554/cam/realmonitor?channel=3&subtype=1"             # set via ANPR_CAMERAS__INBOUND__STREAM_URL (holds credentials)
   outbound:
     id: 2
-    type: webcam
+    type: ip
     device_index: 1
-    stream_url: ""
+    stream_url: "rtsp://bot_pos3:tes_12345@169.254.50.157:554/cam/realmonitor?channel=2&subtype=1"             # set via ANPR_CAMERAS__OUTBOUND__STREAM_URL (holds credentials)
 
 model:
   weights_path: best_new.pt
@@ -43,7 +43,7 @@ ocr:
 
 pipeline:
   # Settings shared by every camera.
-  target_fps: 30              # 1..60
+  target_fps: 20              # 1..60
   reconnect_interval_s: 5     # 1..60
   inactivity_timeout_s: 10    # 1..30
   # With two cameras, an outbound read of a plate whose entry was opened within
@@ -60,6 +60,10 @@ pipeline:
   # the box width/height on each side, so edge characters (e.g. the first
   # letter of a plate) are not clipped. 0 disables padding (0..0.5).
   crop_padding_ratio: 0.10
+  # OCR trigger line as a fraction of frame height (0 = top, 1 = bottom). OCR only
+  # runs once a vehicle's box centre is at or below this line, so vehicles far
+  # up the frame cost no OCR time. 0.5 = bottom half. 0 disables the gate (0..1).
+  ocr_min_y_ratio: 0.5
 
 gate:
   mode: simulation            # simulation | hardware
